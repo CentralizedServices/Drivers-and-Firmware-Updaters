@@ -1,0 +1,526 @@
+<#
+.SYNOPSIS
+    Analyzes DriverPrompt (v5.13+) artifacts to return install/execution errors for RMM.
+
+.DESCRIPTION
+    1. Loads the most recent DriverPrompt_RunSummary_*.json (prefers StartTime when parseable).
+    2. Flags non-success exit codes (20-24). Notes are Severity-filtered:
+       only 'Error'-severity notes surface as RMM alerts (prevents false positives from success events).
+    3. Scans RestartPrompt.log for critical/error indicators.
+    4. Scans today's DriverDownload_yyyyMMdd.log for failure keywords and non-zero exit codes.
+    5. If Behavior 1 is used, inspects DriverInstallAtBoot.log + marker/task state for stuck installs.
+
+.OUTPUTS
+    PSCustomObject containing Status, LastRunTime, LastExitCode, ErrorCount, and ErrorMessages.
+
+.NOTES
+    Aligned with DriverPrompt v5.13 and DFScaner v2.6.
+
+    Version History:
+        1.0  - Initial release. Aligned with DriverPrompt v5.12.
+        1.1  - FIX [Critical #2]:   BootMarker check is now age-gated — only flagged if marker is
+                                     older than $BootMarkerStaleMinutes (default 90 min). Fresh markers
+                                     indicate "just armed, reboot pending" which is expected and healthy.
+               FIX [Critical #3]:   Notes from RunSummary are now Severity-filtered via Get-ErrorNotes.
+                                     Only 'Error'-severity notes become RMM alerts. 'Info' and 'Warning'
+                                     notes are preserved in JSON for diagnostics but do not trigger alerts.
+                                     Legacy string notes (pre-v5.13) are treated as errors for backward compat.
+                                     Replaces Normalize-Notes.
+               FIX [Moderate #13]:  "No run summary found" is only flagged if a trigger was fired today
+                                     (scanner wrote TRIGGER=UPDATES_READY or "Updates ready in"). If the
+                                     scanner found no updates, the popup correctly never ran — no summary
+                                     is written — this is healthy, not an error.
+               FIX [Minor #16]:     'Fail' keyword replaced with '\bFailed\b' (word boundary regex) to
+                                     avoid false matches on "Fallback" log lines emitted by the branding
+                                     cache (e.g., "Branding: Fallback logo applied + cached as lastgood.").
+                                     Same fix applied to boot installer log scan patterns.
+               ADD:                  $BootMarkerStaleMinutes parameter (default 90) controls the age
+                                     threshold for flagging a stale/stuck marker.
+               ADD:                  $DateStamp and $DriverDownloadLog moved to a dedicated pre-check
+                                     section so trigger detection is available before section 1 runs.
+               ADD:                  Boot task orphan check — task is only flagged when no marker exists
+                                     alongside it. Task + fresh marker = expected (armed, reboot pending).
+                                     Task + no marker = orphaned and flagged.
+#>
+
+[CmdletBinding()]
+param(
+    [string]$LogFolder           = 'C:\ProgramData\i3\logs',
+    [string]$InternalLogPath     = 'C:\ProgramData\i3\RestartPrompt.log',
+    [string]$RunSummaryWildcard  = 'DriverPrompt_RunSummary_*.json',
+
+    # Behavior 1 artifacts
+    [string]$BootTaskName        = 'i3_DriverInstallAtBoot',
+    [string]$BootMarkerPath      = 'C:\ProgramData\i3\DriverInstallAtBoot.marker.json',
+    [string]$BootInstallLogPath  = 'C:\ProgramData\i3\logs\DriverInstallAtBoot.log',
+
+    # How much of the internal log to scan
+    [int]$InternalLogTailLines   = 200,
+
+    # FIX #2: Minimum marker age (minutes) before flagging as stuck.
+    # A marker younger than this was just written by a user clicking Restart — healthy.
+    [int]$BootMarkerStaleMinutes = 90
+)
+
+$ErrorList    = New-Object System.Collections.Generic.List[string]
+$LastExitCode = $null
+$LastRunTime  = $null
+$LastSummary  = $null
+
+# ---------------------------------------------------------------------------
+# EXIT CODE MAP (must match DriverPrompt exit codes)
+# ---------------------------------------------------------------------------
+$ExitCodeMap = @{
+    0  = "Success / No Action"
+    10 = "Success / Timeout (User ignored)"
+    11 = "Success / User Chose Restart"
+    20 = "ERROR: Install Failed"
+    21 = "ERROR: No Interactive User (Popup skipped)"
+    22 = "WARNING: Pending Reboot (Skipped)"
+    23 = "WARNING: Install In Progress"
+    24 = "ERROR: Script Already Running (Lock File)"
+}
+
+function Add-Err
+{
+    param(
+        [string]$Message
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Message))
+    {
+        $ErrorList.Add($Message)
+    }
+}
+
+# FIX #3: Replaces Normalize-Notes.
+# Handles both legacy string notes (pre-v5.13) and structured {Severity, Message} objects (v5.13+).
+# Only returns notes that should surface as RMM alerts:
+#   - Legacy strings        → always returned (backward compat)
+#   - Severity = 'Error'   → returned
+#   - Severity = 'Warning' → NOT returned (informational only)
+#   - Severity = 'Info'    → NOT returned (informational only)
+function Get-ErrorNotes
+{
+    param(
+        $Notes
+    )
+
+    if ($null -eq $Notes)
+    {
+        return @()
+    }
+
+    $result = @()
+
+    foreach ($n in $Notes)
+    {
+        if ($n -is [string])
+        {
+            # Legacy format (pre-v5.13): treat all non-empty strings as errors.
+            if (-not [string]::IsNullOrWhiteSpace($n))
+            {
+                $result += $n
+            }
+        }
+        elseif ($null -ne $n -and
+                $n.PSObject.Properties.Match('Severity').Count -gt 0 -and
+                $n.PSObject.Properties.Match('Message').Count  -gt 0)
+        {
+            # Structured format (v5.13+): only surface 'Error' severity.
+            if ($n.Severity -eq 'Error' -and -not [string]::IsNullOrWhiteSpace($n.Message))
+            {
+                $result += $n.Message
+            }
+        }
+        else
+        {
+            # Unknown object format — convert to string and include.
+            $s = "$n"
+            if (-not [string]::IsNullOrWhiteSpace($s))
+            {
+                $result += $s
+            }
+        }
+    }
+
+    return $result
+}
+
+function Try-ReadJson
+{
+    param(
+        [string]$Path
+    )
+
+    try
+    {
+        if (-not (Test-Path $Path))
+        {
+            return $null
+        }
+
+        $raw = Get-Content -Path $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw))
+        {
+            return $null
+        }
+
+        return ($raw | ConvertFrom-Json -ErrorAction Stop)
+    }
+    catch
+    {
+        Add-Err "RunSummary Parse: Failed to parse '$Path' - $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-LatestRunSummary
+{
+    param(
+        [string]$Folder,
+        [string]$Filter
+    )
+
+    if (-not (Test-Path $Folder))
+    {
+        return $null
+    }
+
+    $files = Get-ChildItem -Path $Folder -Filter $Filter -File -ErrorAction SilentlyContinue
+    if (-not $files)
+    {
+        return $null
+    }
+
+    # Prefer sorting by parsed StartTime; fall back to LastWriteTime if unparseable.
+    $candidates = @()
+
+    foreach ($f in $files)
+    {
+        $obj = Try-ReadJson -Path $f.FullName
+        $dt  = $null
+
+        if ($obj -and $obj.StartTime)
+        {
+            try { $dt = [datetime]$obj.StartTime } catch { $dt = $null }
+        }
+
+        $candidates += [pscustomobject]@{
+            File = $f
+            Json = $obj
+            Sort = if ($dt) { $dt } else { $f.LastWriteTime }
+        }
+    }
+
+    return ($candidates | Sort-Object Sort -Descending | Select-Object -First 1)
+}
+
+function Get-ExitCodeLabel
+{
+    param(
+        [int]$Code
+    )
+
+    if ($ExitCodeMap.ContainsKey($Code))
+    {
+        return "$Code ($($ExitCodeMap[$Code]))"
+    }
+
+    return "$Code (Unknown)"
+}
+
+function Select-StringSafe
+{
+    param(
+        [string]$Path,
+        [string[]]$Patterns,
+        [switch]$Regex
+    )
+
+    try
+    {
+        if (-not (Test-Path $Path))
+        {
+            return @()
+        }
+
+        if ($Regex)
+        {
+            return (Select-String -Path $Path -Pattern $Patterns -Encoding UTF8 -ErrorAction SilentlyContinue)
+        }
+
+        return (Select-String -Path $Path -SimpleMatch -Pattern $Patterns -Encoding UTF8 -ErrorAction SilentlyContinue)
+    }
+    catch
+    {
+        return @()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# PRE-CHECK: Did the scanner fire a trigger today?
+#
+# FIX #13: This must run BEFORE section 1 so that the "no summary found" check
+# can distinguish between two cases:
+#   A) Scanner fired a trigger → popup should have run → no summary = error
+#   B) Scanner found no updates → popup correctly skipped → no summary = healthy
+#
+# FIX: $DateStamp and $DriverDownloadLog moved here from section 3 so they are
+# available to both the pre-check and the keyword scan in section 3.
+# ---------------------------------------------------------------------------
+$DateStamp         = Get-Date -Format "yyyyMMdd"
+$DriverDownloadLog = Join-Path -Path $LogFolder -ChildPath "DriverDownload_$DateStamp.log"
+
+$TriggerFiredToday = $false
+if (Test-Path $DriverDownloadLog)
+{
+    $TriggerFiredToday = ($null -ne (
+        Select-String -Path $DriverDownloadLog `
+                      -Pattern @('TRIGGER=UPDATES_READY', 'Updates\s+ready\s+in') `
+                      -Encoding UTF8 -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    ))
+}
+
+# ---------------------------------------------------------------------------
+# 1) ANALYZE MOST RECENT RUN SUMMARY (JSON)
+# ---------------------------------------------------------------------------
+$latest = Get-LatestRunSummary -Folder $LogFolder -Filter $RunSummaryWildcard
+
+if ($latest)
+{
+    $LastSummary = $latest.Json
+    $summaryFile = $latest.File.FullName
+
+    if ($LastSummary)
+    {
+        $LastExitCode = $LastSummary.ExitCode
+
+        if ($LastSummary.StartTime)
+        {
+            $LastRunTime = $LastSummary.StartTime
+        }
+        elseif ($latest.File)
+        {
+            $LastRunTime = $latest.File.LastWriteTime.ToString("o")
+        }
+
+        if ($null -ne $LastExitCode)
+        {
+            $codeInt = 0
+            try { $codeInt = [int]$LastExitCode } catch { $codeInt = 0 }
+
+            # Only treat codes 20-24 as errors (align with DriverPrompt exit code semantics).
+            # Codes 0, 10, 11 are success/informational and are not flagged.
+            if ($codeInt -ge 20 -and $codeInt -le 24)
+            {
+                Add-Err "RunSummary: Script exited with $(Get-ExitCodeLabel -Code $codeInt) | File='$summaryFile'"
+            }
+        }
+        else
+        {
+            Add-Err "RunSummary: ExitCode missing in '$summaryFile'"
+        }
+
+        # FIX #3: Get-ErrorNotes replaces Normalize-Notes.
+        # Only 'Error'-severity structured notes are surfaced as alerts.
+        # Info/Warning notes are preserved in JSON for diagnostics but suppressed here.
+        # e.g. "Armed install-at-boot task..." is Info — no longer causes a false positive.
+        $errorNotes = Get-ErrorNotes -Notes $LastSummary.Notes
+        foreach ($n in $errorNotes)
+        {
+            Add-Err "RunSummary Error Note: $n"
+        }
+    }
+    else
+    {
+        Add-Err "RunSummary: Latest file '$($latest.File.FullName)' could not be parsed."
+    }
+}
+else
+{
+    # FIX #13: Only flag "no summary found" when it is actually an error.
+    # If the scanner fired a trigger today, the popup should have run and written a summary.
+    # If no trigger fired today (scanner found no updates), the popup correctly never ran
+    # and no summary is expected — this is healthy, not an error.
+    if ($TriggerFiredToday)
+    {
+        Add-Err "RunSummary: Trigger fired today but no popup run summary found in '$LogFolder' (filter '$RunSummaryWildcard'). Popup may not have executed."
+    }
+    # else: no updates today → popup skipped → no summary expected → healthy, no error raised.
+}
+
+# ---------------------------------------------------------------------------
+# 2) SCAN INTERNAL LOG (RestartPrompt.log)
+# ---------------------------------------------------------------------------
+if (Test-Path $InternalLogPath)
+{
+    try
+    {
+        $tail = Get-Content -Path $InternalLogPath -Tail $InternalLogTailLines -ErrorAction Stop
+
+        foreach ($line in $tail)
+        {
+            if ($line -match 'CRITICAL ERROR|CRITICAL:|Branding Error:|Enable-InstallAtNextBoot error:|Lock warning|Exception')
+            {
+                Add-Err "Internal Log: $line"
+            }
+        }
+    }
+    catch
+    {
+        Add-Err "Internal Log: Failed to read '$InternalLogPath' - $($_.Exception.Message)"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3) SCAN TODAY'S DRIVERDOWNLOAD LOG (trigger/download/extract log)
+# $DateStamp and $DriverDownloadLog are defined in the pre-check section above.
+# ---------------------------------------------------------------------------
+if (Test-Path $DriverDownloadLog)
+{
+    # FIX #16: 'Fail' replaced with '\bFailed\b' (word boundary regex).
+    # The original 'Fail' matched "Fallback" in branding success lines such as:
+    #   "[SUCCESS] Branding: Fallback logo applied + cached as lastgood."
+    # '\bFailed\b' matches "Failed to extract..." but NOT "Fallback logo applied..."
+    $hits = Select-StringSafe -Path $DriverDownloadLog -Patterns @(
+        'CRITICAL',
+        'FAILED',
+        '\bFailed\b',
+        '\[ERROR\]',
+        'Exception'
+    ) -Regex
+
+    foreach ($h in $hits)
+    {
+        Add-Err "DriverDownload: $($h.Line.Trim())"
+    }
+
+    # Non-zero exit codes (e.g. "ExitCode=20" or "Exit Code: 3010")
+    $exitHits = Select-StringSafe -Path $DriverDownloadLog -Patterns @(
+        'Exit\s*Code\s*[:=]\s*(\d+)',
+        'ExitCode\s*[:=]\s*(\d+)'
+    ) -Regex
+
+    foreach ($eh in $exitHits)
+    {
+        $line = $eh.Line.Trim()
+        $m    = [regex]::Match($line, '(?i)Exit\s*Code\s*[:=]\s*(\d+)|ExitCode\s*[:=]\s*(\d+)')
+
+        if ($m.Success)
+        {
+            $val = $null
+            if ($m.Groups[1].Success)     { $val = $m.Groups[1].Value }
+            elseif ($m.Groups[2].Success) { $val = $m.Groups[2].Value }
+
+            if ($val)
+            {
+                $n = 0
+                if ([int]::TryParse($val, [ref]$n))
+                {
+                    # 0=Success, 259=Already installed, 3010=Reboot required — all expected.
+                    if ($n -ne 0 -and $n -ne 259 -and $n -ne 3010)
+                    {
+                        Add-Err "DriverDownload: Non-success exit code detected ($n) | Line='$line'"
+                    }
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4) BEHAVIOR 1: INSTALL-AT-BOOT STATE CHECKS
+# ---------------------------------------------------------------------------
+
+# FIX #2: Marker check is now age-gated.
+#
+# BEFORE: Any marker presence triggered Add-Err — this flagged every successful Restart
+#         click as an error because DFReport runs immediately after DFPopup, before the
+#         reboot occurs and the boot installer has a chance to clean up the marker.
+#
+# AFTER:  Only flag if the marker is OLDER than $BootMarkerStaleMinutes (default 90 min).
+#         - Fresh marker  (< 90 min): user just clicked Restart, reboot is pending → healthy.
+#         - Stale marker  (> 90 min): reboot happened but cleanup failed → flag as stuck.
+if (Test-Path $BootMarkerPath)
+{
+    $markerItem = Get-Item $BootMarkerPath -ErrorAction SilentlyContinue
+    if ($markerItem)
+    {
+        $markerAge = ((Get-Date) - $markerItem.LastWriteTime).TotalMinutes
+        if ($markerAge -gt $BootMarkerStaleMinutes)
+        {
+            Add-Err "InstallAtBoot: Marker is stale ($([math]::Round($markerAge,0)) min old, threshold=$BootMarkerStaleMinutes min). Expected post-reboot cleanup did not occur — install may be stuck. Path='$BootMarkerPath'"
+        }
+        # else: recently armed — healthy, reboot pending or in progress. No error raised.
+    }
+}
+
+if (Test-Path $BootInstallLogPath)
+{
+    # FIX #16: Same '\bFailed\b' fix applied here for consistency.
+    $bootHits = Select-StringSafe -Path $BootInstallLogPath -Patterns @(
+        'CRITICAL:',
+        'FAILED',
+        '\bFailed\b',
+        '\[ERROR\]',
+        'Exception'
+    ) -Regex
+
+    foreach ($bh in $bootHits)
+    {
+        Add-Err "InstallAtBoot Log: $($bh.Line.Trim())"
+    }
+}
+
+# ADD: Refined task existence check.
+# BEFORE: Any task existence triggered Add-Err (fired on every successful Restart click).
+# AFTER:  Only flag the task as orphaned when NO marker exists alongside it.
+#         Task + marker (fresh)  = expected: armed, reboot pending.
+#         Task + marker (stale)  = already flagged by the age-gated check above.
+#         Task + no marker       = orphaned task, should have been cleaned up → flag it.
+try
+{
+    $q = Start-Process -FilePath "schtasks.exe" -ArgumentList @("/Query", "/TN", $BootTaskName) -NoNewWindow -Wait -PassThru
+
+    if ($q.ExitCode -eq 0)
+    {
+        if (-not (Test-Path $BootMarkerPath))
+        {
+            # Task exists but no marker — marker should exist if the task was legitimately armed.
+            Add-Err "InstallAtBoot: Scheduled task '$BootTaskName' exists but no marker file found — task may be orphaned. Path='$BootMarkerPath'"
+        }
+        # If marker exists: handled by the age-gated check above. No double-flagging here.
+    }
+}
+catch
+{
+    # ignore — schtasks not available or task query failed
+}
+
+# ---------------------------------------------------------------------------
+# OUTPUT
+# ---------------------------------------------------------------------------
+$Status    = if ($ErrorList.Count -gt 0) { "ErrorsFound" } else { "Healthy" }
+$exitLabel = "Unknown"
+
+if ($null -ne $LastExitCode)
+{
+    try
+    {
+        $exitLabel = Get-ExitCodeLabel -Code ([int]$LastExitCode)
+    }
+    catch
+    {
+        $exitLabel = "$LastExitCode (Unknown)"
+    }
+}
+
+[pscustomobject]@{
+    Status        = $Status
+    LastRunTime   = $LastRunTime
+    LastExitCode  = $exitLabel
+    ErrorCount    = $ErrorList.Count
+    ErrorMessages = @($ErrorList)
+}
