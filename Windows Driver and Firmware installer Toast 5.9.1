@@ -1,0 +1,2455 @@
+<#
+.SYNOPSIS
+    Downloads drivers via WU API and prepares user-facing notification workflow.
+
+.DESCRIPTION
+    Main orchestrator for CW RMM. Writes companion scripts to disk from embedded
+    content, downloads driver updates without installing them, registers the
+    protocol handler and scheduled tasks, and starts the notification workflow.
+
+.AUTHOR
+    Ken Kruis
+
+.VERSION
+    5.9.1
+
+.CHANGELOG
+    5.9.1 - Fixed protocol registry command: removed cmd.exe /c wrapper which
+            prevented ShellExecute from finding the script (no log files were
+            produced anywhere, confirming the handler never launched).
+            Added EditFlags = 0x02 (FTA_OpenIsSafe) so Windows does not
+            silently block the protocol from toast/notification context.
+            Added DefaultIcon subkey required by some Windows builds.
+            Added registry read-back diagnostic line in orchestrator log.
+            Wiped old protocol registry key before re-registering to prevent
+            stale values from prior versions poisoning the registration.
+    5.8.9 - Added UserState folder (BUILTIN\Users Modify) for standard-user
+            writable logs and state. Protocol handler v1.1.0 with COM trigger
+            and schtasks fallback. Strengthened install task SDDL (BU/AU/IU).
+    5.8.8 - Local branding logo download; local file:// toast icon reference.
+    5.8.7 - Protocol registry command updated to avoid URI as extra script path.
+#>
+
+#Requires -RunAsAdministrator
+
+[CmdletBinding()]
+param
+(
+    [string]$BasePath = "C:\ProgramData\i3",
+    [int]$NotifyIntervalHours = 4,
+    [int]$NotifyMaxDays = 30,
+    [string]$ToastCaption = "i3 Updates Available",
+    [switch]$Silent,
+    [int]$LogRetentionDays = 30
+)
+
+# ============================================================
+# DERIVED PATHS
+# ============================================================
+$LogPath            = Join-Path $BasePath "logs"
+$UserStatePath      = Join-Path $BasePath "UserState"
+$ManifestPath       = Join-Path $BasePath "DriverUpdateManifest.json"
+$MarkerPath         = Join-Path $BasePath "DriverUpdate_RebootRequired.marker.json"
+$InstallerScriptPath = Join-Path $BasePath "Install-DriversAndRestart.ps1"
+$ToastScriptPath    = Join-Path $BasePath "Show-DriverUpdateToast.ps1"
+$ToastConfigPath    = Join-Path $BasePath "DriverUpdateToast.config.json"
+$ToastStatusPath    = Join-Path $UserStatePath "DriverUpdateToast.status.json"
+$ToastHeartbeatPath = Join-Path $UserStatePath "DriverUpdateToast.started.txt"
+$ProtocolHandlerPath = Join-Path $BasePath "Request-DriverInstall.ps1"
+$ProtocolLogPath    = Join-Path $UserStatePath "Request-DriverInstall.log"
+$BrandingPath       = Join-Path $BasePath "branding"
+$LogoFileName       = "i3_CharmOnly_150x150_toast.png"
+$LogoUrl            = "https://s3.us-east-1.wasabisys.com/i3-blob-storage/Installers/i3_CharmOnly_150x150_toast.png"
+$LogoLocalPath      = Join-Path $BrandingPath $LogoFileName
+
+$InstallTaskName = "i3_DriverInstallAndRestart"
+$BootTaskName    = "i3_DriverInstallAtBoot"
+$ToastTaskName   = "i3_DriverUpdateNotify"
+$EventLogSource  = "i3DriverUpdate"
+$EventLogName    = "Application"
+$ProtocolName    = "i3-drivers"
+$SnoozeSeconds   = [Math]::Max(60, $NotifyIntervalHours * 3600)
+
+# ============================================================
+# EXIT CODES
+# ============================================================
+$INTERNAL_SUCCESS         = 0
+$INTERNAL_NO_UPDATES      = 10
+$INTERNAL_ALREADY_RUNNING = 11
+$INTERNAL_NOT_ADMIN       = 21
+$INTERNAL_WU_UNAVAILABLE  = 22
+$INTERNAL_DOWNLOAD_FAIL   = 23
+$INTERNAL_INFRA_FAILED    = 25
+$INTERNAL_WRITE_FAILED    = 26
+$INTERNAL_CRITICAL        = 99
+
+function Get-CWExitCode
+{
+    param ([int]$Code)
+    switch ($Code)
+    {
+        0  { return 0  }
+        10 { return 0  }
+        11 { return 0  }
+        21 { return 1  }
+        22 { return 2  }
+        23 { return 3  }
+        25 { return 5  }
+        26 { return 6  }
+        99 { return 99 }
+        default { return $Code }
+    }
+}
+
+# ============================================================
+# METADATA
+# ============================================================
+$ScriptName    = "i3-DriverUpdate"
+$ScriptVersion = "5.9.1"
+$RunStamp      = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile       = Join-Path $LogPath "${ScriptName}_${RunStamp}.log"
+$SummaryPath   = Join-Path $LogPath "${ScriptName}_RunSummary_${RunStamp}.json"
+$LockFile      = Join-Path $BasePath "${ScriptName}.lock"
+
+# ============================================================
+# LOGGING
+# ============================================================
+function Write-Log
+{
+    param ([string]$Message, [string]$Level = "INFO")
+    $Line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level.ToUpper(), $Message
+    if (-not $Silent) { Write-Host $Line }
+    try
+    {
+        if (-not (Test-Path -Path $LogPath)) { New-Item -Path $LogPath -ItemType Directory -Force | Out-Null }
+        Add-Content -Path $LogFile -Value $Line -ErrorAction Stop
+    }
+    catch { }
+}
+
+function Write-RunSummary
+{
+    param ([hashtable]$Summary)
+    try { $Summary | ConvertTo-Json -Depth 10 | Out-File -FilePath $SummaryPath -Encoding UTF8 -Force }
+    catch { }
+}
+
+function Remove-OldLogs
+{
+    try
+    {
+        foreach ($Path in @($LogPath, $UserStatePath))
+        {
+            if (-not (Test-Path -Path $Path)) { continue }
+            $Cutoff = (Get-Date).AddDays(-$LogRetentionDays)
+            Get-ChildItem -Path $Path -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $Cutoff } |
+                ForEach-Object { Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    catch { }
+}
+
+# ============================================================
+# FOLDERS / ACLs
+# ============================================================
+function Initialize-i3Folders
+{
+    try
+    {
+        foreach ($Directory in @($BasePath, $LogPath, $UserStatePath, $BrandingPath))
+        {
+            if (-not (Test-Path -Path $Directory)) { New-Item -Path $Directory -ItemType Directory -Force | Out-Null }
+        }
+        Write-Log "Verified base, log, UserState, and branding folders." "INFO"
+        return $true
+    }
+    catch
+    {
+        Write-Log ("Failed to initialize folder structure: {0}" -f $_.Exception.Message) "ERROR"
+        return $false
+    }
+}
+
+function Set-i3FolderPermissions
+{
+    try
+    {
+        if (-not (Test-Path -Path $UserStatePath)) { New-Item -Path $UserStatePath -ItemType Directory -Force | Out-Null }
+        $Acl  = Get-Acl -Path $UserStatePath
+        $Rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "BUILTIN\Users", "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+        $Acl.SetAccessRule($Rule)
+        Set-Acl -Path $UserStatePath -AclObject $Acl
+        Write-Log ("Granted BUILTIN\Users Modify access to UserState only: {0}" -f $UserStatePath) "SUCCESS"
+        return $true
+    }
+    catch
+    {
+        Write-Log ("Failed to set UserState permissions: {0}" -f $_.Exception.Message) "WARN"
+        return $false
+    }
+}
+
+# ============================================================
+# LOCK FILE
+# ============================================================
+function New-LockFile
+{
+    try
+    {
+        $LockData = @{ ScriptName = $ScriptName; PID = $PID; Computer = $env:COMPUTERNAME; CreatedAt = (Get-Date).ToString("o") }
+        $Bytes    = [Text.Encoding]::UTF8.GetBytes(($LockData | ConvertTo-Json -Depth 5))
+        $Stream   = [IO.File]::Open($LockFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try   { $Stream.Write($Bytes, 0, $Bytes.Length); $Stream.Flush() }
+        finally { $Stream.Close(); $Stream.Dispose() }
+        return $true
+    }
+    catch [IO.IOException]
+    {
+        try
+        {
+            $Existing = Get-Content -Path $LockFile -Raw -ErrorAction Stop | ConvertFrom-Json
+            if (((Get-Date) - [datetime]$Existing.CreatedAt).TotalHours -gt 4)
+            {
+                Remove-Item -Path $LockFile -Force -ErrorAction SilentlyContinue
+                return (New-LockFile)
+            }
+        }
+        catch { }
+        Write-Log "Lock held - another instance running." "WARN"
+        return $false
+    }
+    catch { return $false }
+}
+
+function Remove-LockFile
+{
+    try { if (Test-Path -Path $LockFile) { Remove-Item -Path $LockFile -Force -ErrorAction SilentlyContinue } }
+    catch { }
+}
+
+# ============================================================
+# COM / HELPERS
+# ============================================================
+function Clear-ComObjects
+{
+    param ([Collections.Generic.List[object]]$Objects)
+    foreach ($Object in $Objects)
+    {
+        if ($Object) { try { [Runtime.InteropServices.Marshal]::ReleaseComObject($Object) | Out-Null } catch { } }
+    }
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+}
+
+function Get-ResultCodeText
+{
+    param ([int]$Code)
+    switch ($Code)
+    {
+        0 { return "NotStarted" }; 1 { return "InProgress" }; 2 { return "Succeeded" }
+        3 { return "SucceededWithErrors" }; 4 { return "Failed" }; 5 { return "Aborted" }
+        default { return "Unknown($Code)" }
+    }
+}
+
+function Get-ActiveConsoleUser
+{
+    try { $CS = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue; if ($CS.UserName) { return $CS.UserName } } catch { }
+    try
+    {
+        $QueryUserOutput = query user 2>$null
+        if ($QueryUserOutput) { foreach ($Line in $QueryUserOutput) { if ($Line -match '^\s*([^\s>]+).*\sActive\s') { return $matches[1] } } }
+    }
+    catch { }
+    try
+    {
+        $Proc = Get-Process explorer -IncludeUserName -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending | Select-Object -First 1
+        if ($Proc.UserName) { return $Proc.UserName }
+    }
+    catch { }
+    return $null
+}
+
+function Test-ScriptParse
+{
+    param ([string]$FilePath)
+    $FileName = Split-Path -Path $FilePath -Leaf
+    try
+    {
+        $Content = Get-Content -Path $FilePath -Raw -ErrorAction Stop
+        $null    = [ScriptBlock]::Create($Content)
+        Write-Log ("Parse check PASSED: {0}" -f $FileName) "SUCCESS"
+        return $true
+    }
+    catch
+    {
+        Write-Log ("Parse check FAILED: {0} -- {1}" -f $FileName, $_.Exception.Message) "ERROR"
+        return $false
+    }
+}
+
+# ============================================================
+# CLEANUP
+# ============================================================
+function Remove-LegacyArtifacts
+{
+    foreach ($TaskName in @("CW-RMM_RestartPrompt", "i3_DriverUpdatePrompt"))
+    {
+        try
+        {
+            $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if ($Task) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop; Write-Log ("Removed legacy task: {0}" -f $TaskName) "INFO" }
+        }
+        catch { }
+    }
+
+    foreach ($Path in @(
+        (Join-Path $BasePath "DriverInstallAtBoot.marker.json"),
+        (Join-Path $BasePath "DriverInstall_ReviewRequired.json"),
+        (Join-Path $BasePath "Install-StagedDriversAtBoot.ps1"),
+        (Join-Path $BasePath "RestartPrompt.ps1"),
+        (Join-Path $BasePath "RestartPrompt.vbs"),
+        (Join-Path $BasePath "RestartPrompt.state.json"),
+        (Join-Path $BasePath "DriverUpdatePrompt.ps1"),
+        (Join-Path $BasePath "DriverUpdatePrompt.vbs"),
+        (Join-Path $BasePath "DriverUpdatePrompt.state.json"),
+        (Join-Path $BasePath "DriverUpdatePrompt.config.json"),
+        (Join-Path $BasePath "Show-DriverUpdateToast.vbs"),
+        (Join-Path $BasePath "Request-DriverInstall.cmd"),
+        (Join-Path $LogPath  "Request-DriverInstall.log")
+    ))
+    {
+        try
+        {
+            if (Test-Path -Path $Path) { Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue; Write-Log ("Removed legacy: {0}" -f (Split-Path -Path $Path -Leaf)) "INFO" }
+        }
+        catch { }
+    }
+
+    $OldDir = Join-Path $BasePath "Drivers"
+    try
+    {
+        if (Test-Path -Path $OldDir)
+        {
+            $FileCount = @(Get-ChildItem -Path $OldDir -Recurse -File -ErrorAction SilentlyContinue).Count
+            Remove-Item -Path $OldDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log ("Removed legacy staging dir ({0} files)" -f $FileCount) "INFO"
+        }
+    }
+    catch { }
+}
+
+# ============================================================
+# WRITE LOCAL FILES
+# ============================================================
+function Write-ToastConfig
+{
+    @{ Caption = $ToastCaption; UserStatePath = $UserStatePath } |
+        ConvertTo-Json | Out-File -FilePath $ToastConfigPath -Encoding UTF8 -Force
+    Write-Log "Toast config written." "INFO"
+}
+
+function Write-ProtocolHandler
+{
+    $Content = @'
+[CmdletBinding()]
+param
+(
+    [string]$ProtocolArg
+)
+
+$BasePath = "C:\ProgramData\i3"
+$UserStatePath = Join-Path $BasePath "UserState"
+$LogFile = Join-Path $UserStatePath "Request-DriverInstall.log"
+$FallbackLog = Join-Path $env:TEMP "Request-DriverInstall_fallback.log"
+$TaskName = "i3_DriverInstallAndRestart"
+$ScriptName = "Request-DriverInstall"
+$ScriptVersion = "1.1.0"
+$InternalExit = 0
+
+function Write-Log
+{
+    param
+    (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $Line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level.ToUpper(), $Message
+    $WrotePrimary = $false
+
+    try
+    {
+        if (-not (Test-Path -Path $UserStatePath))
+        {
+            New-Item -Path $UserStatePath -ItemType Directory -Force | Out-Null
+        }
+
+        Add-Content -Path $LogFile -Value $Line -ErrorAction Stop
+        $WrotePrimary = $true
+    }
+    catch
+    {
+        try
+        {
+            Add-Content -Path $FallbackLog -Value $Line -ErrorAction SilentlyContinue
+        }
+        catch
+        {
+        }
+    }
+
+    if (-not $WrotePrimary)
+    {
+        try
+        {
+            Add-Content -Path $FallbackLog -Value ("{0} [WARN] Primary log write failed. Fallback log used: {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $FallbackLog) -ErrorAction SilentlyContinue
+        }
+        catch
+        {
+        }
+    }
+}
+
+function Invoke-TaskViaCom
+{
+    param
+    (
+        [string]$Name
+    )
+
+    $Scheduler = $null
+    $Folder = $null
+    $Task = $null
+
+    try
+    {
+        Write-Log ("Attempting COM task trigger: {0}" -f $Name) "INFO"
+
+        $Scheduler = New-Object -ComObject Schedule.Service
+        $Scheduler.Connect()
+        $Folder = $Scheduler.GetFolder("\")
+        $Task = $Folder.GetTask($Name)
+
+        Write-Log "COM task lookup succeeded." "SUCCESS"
+        $null = $Task.Run($null)
+        Write-Log "COM task Run() call succeeded." "SUCCESS"
+        return $true
+    }
+    catch
+    {
+        Write-Log ("COM task trigger failed: {0}" -f $_.Exception.Message) "ERROR"
+        return $false
+    }
+    finally
+    {
+        foreach ($Object in @($Task, $Folder, $Scheduler))
+        {
+            if ($Object)
+            {
+                try
+                {
+                    [Runtime.InteropServices.Marshal]::ReleaseComObject($Object) | Out-Null
+                }
+                catch
+                {
+                }
+            }
+        }
+    }
+}
+
+function Invoke-TaskViaSchTasks
+{
+    param
+    (
+        [string]$Name
+    )
+
+    try
+    {
+        Write-Log ("Attempting schtasks.exe trigger: {0}" -f $Name) "INFO"
+
+        $Output = & schtasks.exe /Run /TN "\$Name" 2>&1
+        $ExitCode = $LASTEXITCODE
+
+        foreach ($Line in @($Output))
+        {
+            Write-Log ("schtasks: {0}" -f $Line) "INFO"
+        }
+
+        Write-Log ("schtasks.exe exit code: {0}" -f $ExitCode) "INFO"
+
+        if ($ExitCode -eq 0)
+        {
+            Write-Log "schtasks.exe task trigger succeeded." "SUCCESS"
+            return $true
+        }
+
+        return $false
+    }
+    catch
+    {
+        Write-Log ("schtasks.exe task trigger failed: {0}" -f $_.Exception.Message) "ERROR"
+        return $false
+    }
+}
+
+try
+{
+    Write-Log "============================================================" "INFO"
+    Write-Log ("Script: {0} v{1}" -f $ScriptName, $ScriptVersion) "INFO"
+    Write-Log ("Computer: {0}" -f $env:COMPUTERNAME) "INFO"
+    Write-Log ("User: {0}" -f [Security.Principal.WindowsIdentity]::GetCurrent().Name) "INFO"
+    Write-Log ("ProtocolArg: {0}" -f $ProtocolArg) "INFO"
+    Write-Log ("PrimaryLog: {0}" -f $LogFile) "INFO"
+    Write-Log ("FallbackLog: {0}" -f $FallbackLog) "INFO"
+    Write-Log ("Target task: {0}" -f $TaskName) "INFO"
+
+    try
+    {
+        $WhoAmI = & whoami.exe /user 2>&1
+        foreach ($Line in @($WhoAmI))
+        {
+            Write-Log ("whoami /user: {0}" -f $Line) "INFO"
+        }
+
+        $Groups = & whoami.exe /groups 2>&1
+        foreach ($Line in @($Groups))
+        {
+            Write-Log ("whoami /groups: {0}" -f $Line) "INFO"
+        }
+    }
+    catch
+    {
+        Write-Log ("whoami logging failed: {0}" -f $_.Exception.Message) "WARN"
+    }
+
+    $Triggered = Invoke-TaskViaCom -Name $TaskName
+
+    if (-not $Triggered)
+    {
+        Write-Log "COM trigger failed. Trying schtasks.exe fallback." "WARN"
+        $Triggered = Invoke-TaskViaSchTasks -Name $TaskName
+    }
+
+    if ($Triggered)
+    {
+        Write-Log "Task trigger succeeded." "SUCCESS"
+        $InternalExit = 0
+    }
+    else
+    {
+        Write-Log "Task trigger failed by all methods." "ERROR"
+        $InternalExit = 1
+    }
+}
+catch
+{
+    $InternalExit = 1
+    Write-Log ("Unhandled failure: {0}" -f $_.Exception.Message) "ERROR"
+
+    if ($_.ScriptStackTrace)
+    {
+        Write-Log ("Stack: {0}" -f $_.ScriptStackTrace) "ERROR"
+    }
+}
+finally
+{
+    Write-Log ("Exit: {0}" -f $InternalExit) "INFO"
+    [Environment]::Exit($InternalExit)
+}
+'@
+    Set-Content -Path $ProtocolHandlerPath -Value $Content -Force -Encoding UTF8
+    Write-Log "Protocol handler written (v1.1.0 with UserState logging, COM trigger, and schtasks fallback)." "INFO"
+}
+
+function Write-InstallerScript
+{
+    $Content = @'
+<#
+.SYNOPSIS
+    Installs downloaded driver updates via WU API and restarts.
+
+.DESCRIPTION
+    Called as SYSTEM via the i3_DriverInstallAndRestart scheduled task.
+
+.AUTHOR
+    Ken Kruis
+
+.VERSION
+    3.5.5
+#>
+
+[CmdletBinding()]
+param
+(
+    [switch]$UserInitiated,
+    [switch]$Silent
+)
+
+$BasePath = "C:\ProgramData\i3"
+$LogPath = Join-Path $BasePath "logs"
+$UserStatePath = Join-Path $BasePath "UserState"
+$ManifestPath = Join-Path $BasePath "DriverUpdateManifest.json"
+$MarkerPath = Join-Path $BasePath "DriverUpdate_RebootRequired.marker.json"
+$ToastScriptPath = Join-Path $BasePath "Show-DriverUpdateToast.ps1"
+$ProtocolHandlerPath = Join-Path $BasePath "Request-DriverInstall.ps1"
+$ToastConfigPath = Join-Path $BasePath "DriverUpdateToast.config.json"
+$ProtocolLogPath = Join-Path $UserStatePath "Request-DriverInstall.log"
+$ProtocolName = "i3-drivers"
+$InstallTaskName = "i3_DriverInstallAndRestart"
+$BootTaskName = "i3_DriverInstallAtBoot"
+$ToastTaskName = "i3_DriverUpdateNotify"
+$RestartDelaySec = 60
+$WUBusyRetryCount = 3
+$WUBusyRetryDelaySec = 20
+$ToastAppId = "i3ITManagement.DriverUpdate"
+$ToastAppDisplayName = "Business Solutions"
+
+$INTERNAL_SUCCESS = 0
+$INTERNAL_NO_MANIFEST = 10
+$INTERNAL_ALREADY_RUNNING = 11
+$INTERNAL_NOT_ADMIN = 12
+$INTERNAL_WU_UNAVAILABLE = 13
+$INTERNAL_NO_MATCHING = 14
+$INTERNAL_WU_BUSY = 15
+$INTERNAL_PARTIAL = 20
+$INTERNAL_TOTAL_FAIL = 21
+$INTERNAL_CRITICAL = 99
+
+$ScriptName = "Install-DriversAndRestart"
+$ScriptVersion = "3.5.5"
+$RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$LogFile = Join-Path $LogPath "${ScriptName}_${RunStamp}.log"
+$SummaryPath = Join-Path $LogPath "${ScriptName}_RunSummary_${RunStamp}.json"
+$LockFile = Join-Path $BasePath "${ScriptName}.lock"
+$StartedMarker = Join-Path $UserStatePath "${ScriptName}_${RunStamp}.started"
+$SelfPath = $null
+
+try
+{
+    $SelfPath = $MyInvocation.MyCommand.Path
+}
+catch
+{
+}
+
+try
+{
+    foreach ($Directory in @($LogPath, $UserStatePath))
+    {
+        if (-not (Test-Path $Directory))
+        {
+            New-Item $Directory -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    "Started: $(Get-Date -Format 'o') | PID: $PID | User: $([Security.Principal.WindowsIdentity]::GetCurrent().Name) | Mode: $(if ($UserInitiated) { 'UserInitiated' } else { 'AtStartup' }) | v$ScriptVersion" |
+        Out-File -FilePath $StartedMarker -Encoding UTF8 -Force
+}
+catch
+{
+}
+
+function Write-Log
+{
+    param
+    (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $Line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level.ToUpper(), $Message
+
+    if (-not $Silent)
+    {
+        Write-Host $Line
+    }
+
+    try
+    {
+        if (-not (Test-Path $LogPath))
+        {
+            New-Item $LogPath -ItemType Directory -Force | Out-Null
+        }
+
+        Add-Content -Path $LogFile -Value $Line -ErrorAction Stop
+    }
+    catch
+    {
+    }
+}
+
+function Write-RunSummary
+{
+    param
+    (
+        [hashtable]$Data
+    )
+
+    try
+    {
+        $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $SummaryPath -Encoding UTF8 -Force
+    }
+    catch
+    {
+    }
+}
+
+function Get-WUResultText
+{
+    param
+    (
+        [int]$Code
+    )
+
+    switch ($Code)
+    {
+        0 { return "NotStarted" }
+        1 { return "InProgress" }
+        2 { return "Succeeded" }
+        3 { return "SucceededWithErrors" }
+        4 { return "Failed" }
+        5 { return "Aborted" }
+        default { return "Unknown($Code)" }
+    }
+}
+
+function New-LockFile
+{
+    try
+    {
+        $Data = @{
+            ScriptName = $ScriptName
+            PID = $PID
+            Computer = $env:COMPUTERNAME
+            CreatedAt = (Get-Date).ToString("o")
+            Mode = if ($UserInitiated) { "UserInitiated" } else { "AtStartup" }
+        }
+
+        $Bytes = [Text.Encoding]::UTF8.GetBytes(($Data | ConvertTo-Json -Depth 5))
+        $Stream = [IO.File]::Open($LockFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+
+        try
+        {
+            $Stream.Write($Bytes, 0, $Bytes.Length)
+            $Stream.Flush()
+        }
+        finally
+        {
+            $Stream.Close()
+            $Stream.Dispose()
+        }
+
+        return $true
+    }
+    catch [IO.IOException]
+    {
+        try
+        {
+            $Existing = Get-Content $LockFile -Raw -ErrorAction Stop | ConvertFrom-Json
+
+            if (((Get-Date) - [datetime]$Existing.CreatedAt).TotalHours -gt 2)
+            {
+                Write-Log "Stale lock greater than 2 hours. Clearing." "WARN"
+                Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+                return (New-LockFile)
+            }
+
+            Write-Log ("Lock held by PID {0} since {1}." -f $Existing.PID, $Existing.CreatedAt) "WARN"
+        }
+        catch
+        {
+        }
+
+        return $false
+    }
+    catch
+    {
+        return $false
+    }
+}
+
+function Remove-LockFile
+{
+    try
+    {
+        if (Test-Path $LockFile)
+        {
+            Remove-Item $LockFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch
+    {
+    }
+}
+
+function Clear-ComObjects
+{
+    param
+    (
+        [Collections.Generic.List[object]]$Objects
+    )
+
+    foreach ($Object in $Objects)
+    {
+        if ($Object)
+        {
+            try
+            {
+                [Runtime.InteropServices.Marshal]::ReleaseComObject($Object) | Out-Null
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+}
+
+function Test-WUBusy
+{
+    try
+    {
+        $Installer = New-Object -ComObject Microsoft.Update.Installer
+        $Busy = $Installer.IsBusy
+        [Runtime.InteropServices.Marshal]::ReleaseComObject($Installer) | Out-Null
+        return $Busy
+    }
+    catch
+    {
+        return $false
+    }
+}
+
+function Wait-WUReady
+{
+    param
+    (
+        [int]$MaxRetries,
+        [int]$DelaySeconds
+    )
+
+    for ($Index = 0; $Index -lt $MaxRetries; $Index++)
+    {
+        if (-not (Test-WUBusy))
+        {
+            if ($Index -gt 0)
+            {
+                Write-Log "WU ready after $Index retries." "SUCCESS"
+            }
+
+            return $true
+        }
+
+        Write-Log ("WU busy ({0}/{1}, waiting {2}s)..." -f ($Index + 1), $MaxRetries, $DelaySeconds) "WARN"
+        Start-Sleep -Seconds $DelaySeconds
+    }
+
+    Write-Log "WU stayed busy after $MaxRetries retries." "ERROR"
+    return $false
+}
+
+function Test-PendingReboot
+{
+    $Pending = $false
+    $Reasons = [Collections.Generic.List[string]]::new()
+
+    try
+    {
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending")
+        {
+            $Pending = $true
+            $Reasons.Add("CBS")
+        }
+    }
+    catch
+    {
+    }
+
+    try
+    {
+        if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired")
+        {
+            $Pending = $true
+            $Reasons.Add("WU")
+        }
+    }
+    catch
+    {
+    }
+
+    try
+    {
+        if ($null -ne (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue))
+        {
+            $Pending = $true
+            $Reasons.Add("PFR")
+        }
+    }
+    catch
+    {
+    }
+
+    return [PSCustomObject]@{
+        Pending = $Pending
+        Reasons = @($Reasons)
+    }
+}
+
+function Stop-ToastTask
+{
+    try
+    {
+        if (Get-ScheduledTask -TaskName $ToastTaskName -ErrorAction SilentlyContinue)
+        {
+            Unregister-ScheduledTask -TaskName $ToastTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log "Toast task removed." "INFO"
+        }
+    }
+    catch
+    {
+        Write-Log ("Failed to remove toast task: {0}" -f $_.Exception.Message) "WARN"
+    }
+}
+
+function Send-UserToast
+{
+    param
+    (
+        [string]$Title,
+        [string]$Body,
+        [string]$Suffix = "Msg"
+    )
+
+    $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+
+    if ($CurrentUser -match '^(NT AUTHORITY\\SYSTEM|SYSTEM)$')
+    {
+        Write-Log ("Send-UserToast skipped ({0}): running as SYSTEM. Suffix: {1}" -f $CurrentUser, $Suffix) "INFO"
+        return
+    }
+
+    try
+    {
+        $RegistryPath = "HKCU:\SOFTWARE\Classes\AppUserModelId\$ToastAppId"
+
+        if (-not (Test-Path $RegistryPath))
+        {
+            New-Item $RegistryPath -Force | Out-Null
+        }
+
+        Set-ItemProperty $RegistryPath -Name "DisplayName" -Value $ToastAppDisplayName -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty $RegistryPath -Name "ShowInActionCenter" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+
+        $Xml = '<toast duration="long"><visual><binding template="ToastGeneric">' +
+               '<image placement="appLogoOverride" src="file:///C:/ProgramData/i3/branding/i3_CharmOnly_150x150_toast.png" hint-crop="circle"/>' +
+               "<text>$([Security.SecurityElement]::Escape($Title))</text>" +
+               "<text>$([Security.SecurityElement]::Escape($Body))</text>" +
+               '<text placement="attribution">Business Solutions</text>' +
+               '</binding></visual><audio src="ms-winsoundevent:Notification.Reminder"/></toast>'
+
+        $XmlDoc = [Windows.Data.Xml.Dom.XmlDocument]::new()
+        $XmlDoc.LoadXml($Xml)
+        $Toast = [Windows.UI.Notifications.ToastNotification]::new($XmlDoc)
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($ToastAppId).Show($Toast)
+
+        Write-Log ("Toast ({0}) shown." -f $Suffix) "SUCCESS"
+        Start-Sleep -Seconds 3
+    }
+    catch
+    {
+        Write-Log ("Send-UserToast failed: {0}" -f $_.Exception.Message) "WARN"
+    }
+}
+
+function Remove-Infrastructure
+{
+    Write-Log "Removing infrastructure..." "INFO"
+
+    foreach ($FilePath in @($ManifestPath, $MarkerPath, $ProtocolHandlerPath, $ToastScriptPath, $ToastConfigPath))
+    {
+        if (Test-Path $FilePath)
+        {
+            Remove-Item $FilePath -Force -ErrorAction SilentlyContinue
+            Write-Log ("  Removed: {0}" -f (Split-Path $FilePath -Leaf)) "INFO"
+        }
+    }
+
+    foreach ($TaskName in @($InstallTaskName, $BootTaskName, $ToastTaskName))
+    {
+        if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+        {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Log ("  Removed task: {0}" -f $TaskName) "INFO"
+        }
+    }
+
+    $ProtocolRegistryPath = "HKLM:\SOFTWARE\Classes\$ProtocolName"
+
+    if (Test-Path $ProtocolRegistryPath)
+    {
+        Remove-Item $ProtocolRegistryPath -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log "  Removed protocol registry." "INFO"
+    }
+
+    if ($SelfPath -and (Test-Path $SelfPath))
+    {
+        Remove-Item $SelfPath -Force -ErrorAction SilentlyContinue
+        Write-Log "  Removed self." "INFO"
+    }
+
+    Write-Log "Infrastructure removed." "INFO"
+}
+
+$ComObjects = [Collections.Generic.List[object]]::new()
+$InternalExitCode = $INTERNAL_SUCCESS
+$InstallSuccess = 0
+$InstallFail = 0
+$AlreadyInstalled = 0
+$RebootCount = 0
+$Status = "Unknown"
+
+try
+{
+    $Mode = if ($UserInitiated) { "UserInitiated" } else { "AtStartup" }
+
+    Write-Log "============================================================" "INFO"
+    Write-Log ("Script: {0} v{1} | Mode: {2}" -f $ScriptName, $ScriptVersion, $Mode) "INFO"
+    Write-Log ("Computer: {0} | PID: {1}" -f $env:COMPUTERNAME, $PID) "INFO"
+    Write-Log ("User: {0}" -f [Security.Principal.WindowsIdentity]::GetCurrent().Name) "INFO"
+    Write-Log "============================================================" "INFO"
+
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+    {
+        $InternalExitCode = $INTERNAL_NOT_ADMIN
+        throw "Not running as administrator."
+    }
+
+    Write-Log "Admin check passed." "INFO"
+
+    if (-not (New-LockFile))
+    {
+        $InternalExitCode = $INTERNAL_ALREADY_RUNNING
+        throw "Already running; lock held."
+    }
+
+    Stop-ToastTask
+
+    if (Test-Path $ProtocolLogPath)
+    {
+        Write-Log "Protocol log found." "INFO"
+
+        try
+        {
+            $ProtoLines = @(Get-Content $ProtocolLogPath -Tail 80 -ErrorAction Stop)
+            Remove-Item $ProtocolLogPath -Force -ErrorAction SilentlyContinue
+
+            foreach ($PLine in $ProtoLines)
+            {
+                Write-Log ("  proto: {0}" -f $PLine) "INFO"
+            }
+        }
+        catch
+        {
+            Write-Log ("Protocol log read failed: {0}" -f $_.Exception.Message) "WARN"
+        }
+    }
+
+    if (-not (Test-Path $ManifestPath))
+    {
+        if ($UserInitiated -and (Test-Path $MarkerPath))
+        {
+            try
+            {
+                $Marker = Get-Content $MarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json
+
+                if ($Marker.Status -eq "RebootPendingAfterInstall")
+                {
+                    Write-Log "Follow-up restart path." "INFO"
+                    Remove-Infrastructure
+                    Send-UserToast -Title "Driver Updates" -Body "Restarting in $RestartDelaySec seconds to finish driver updates. Please save your work." -Suffix "PreRestart"
+                    & shutdown.exe /r /t $RestartDelaySec /c "Completing driver updates." /d p:2:17
+                    Write-Log ("Restart scheduled ({0} sec)." -f $RestartDelaySec) "SUCCESS"
+                    Remove-LockFile
+                    [Environment]::Exit($INTERNAL_SUCCESS)
+                }
+            }
+            catch
+            {
+                Write-Log ("Follow-up restart check failed: {0}" -f $_.Exception.Message) "WARN"
+            }
+        }
+
+        $InternalExitCode = $INTERNAL_NO_MANIFEST
+        throw "No manifest found."
+    }
+
+    $Manifest = Get-Content $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    $ManifestIds = @{}
+
+    foreach ($Entry in $Manifest.Updates)
+    {
+        $ManifestIds[$Entry.UpdateID] = $Entry
+    }
+
+    Write-Log ("Manifest: {0} update(s) from {1}" -f $Manifest.Updates.Count, $Manifest.CreatedAt) "INFO"
+
+    if (-not (Get-Service wuauserv -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Running" }))
+    {
+        Write-Log "Starting wuauserv..." "INFO"
+        Start-Service wuauserv -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 5
+    }
+
+    if (-not (Get-Service wuauserv -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq "Running" }))
+    {
+        $InternalExitCode = $INTERNAL_WU_UNAVAILABLE
+        throw "Windows Update service is not running."
+    }
+
+    Write-Log "Creating WU session..." "INFO"
+    $Session = New-Object -ComObject Microsoft.Update.Session
+    $Searcher = $Session.CreateUpdateSearcher()
+    $ComObjects.Add($Session)
+    $ComObjects.Add($Searcher)
+
+    $SearchResult = $Searcher.Search("IsInstalled=0 and Type='Driver'")
+    $UpdatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+    $ComObjects.Add($UpdatesToInstall)
+
+    Write-Log ("WU search: {0} result(s)." -f $SearchResult.Updates.Count) "INFO"
+
+    for ($Index = 0; $Index -lt $SearchResult.Updates.Count; $Index++)
+    {
+        $Update = $SearchResult.Updates.Item($Index)
+
+        if (-not $ManifestIds.ContainsKey($Update.Identity.UpdateID))
+        {
+            continue
+        }
+
+        if ($Update.IsDownloaded)
+        {
+            [void]$UpdatesToInstall.Add($Update)
+            Write-Log ("  Matched downloaded update: {0}" -f $Update.Title) "INFO"
+        }
+        else
+        {
+            Write-Log ("  Re-downloading: {0}" -f $Update.Title) "WARN"
+
+            if (-not $Update.EulaAccepted)
+            {
+                $Update.AcceptEula()
+            }
+
+            $RedownloadCollection = New-Object -ComObject Microsoft.Update.UpdateColl
+            [void]$RedownloadCollection.Add($Update)
+            $Redownloader = $Session.CreateUpdateDownloader()
+            $Redownloader.Updates = $RedownloadCollection
+            $RedownloadResult = $Redownloader.Download()
+
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($Redownloader) | Out-Null
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($RedownloadCollection) | Out-Null
+
+            if ($RedownloadResult.GetUpdateResult(0).ResultCode -eq 2)
+            {
+                [void]$UpdatesToInstall.Add($Update)
+                Write-Log "  Re-download succeeded." "SUCCESS"
+            }
+            else
+            {
+                $InstallFail++
+                Write-Log ("  Re-download FAILED: {0}" -f $Update.Title) "ERROR"
+            }
+        }
+
+        $ManifestIds.Remove($Update.Identity.UpdateID)
+    }
+
+    foreach ($Key in $ManifestIds.Keys)
+    {
+        $AlreadyInstalled++
+        Write-Log ("  Already installed or no longer applicable: {0}" -f $ManifestIds[$Key].Title) "SUCCESS"
+    }
+
+    if ($UpdatesToInstall.Count -eq 0)
+    {
+        if ($AlreadyInstalled -gt 0 -and $InstallFail -eq 0)
+        {
+            $Status = "AlreadyComplete"
+            Write-Log "All updates already installed." "SUCCESS"
+            Remove-Infrastructure
+        }
+        else
+        {
+            $Status = "NoMatch"
+            $InternalExitCode = $INTERNAL_NO_MATCHING
+        }
+
+        throw "Nothing to install."
+    }
+
+    if (-not (Wait-WUReady -MaxRetries $WUBusyRetryCount -DelaySeconds $WUBusyRetryDelaySec))
+    {
+        $Status = "WUBusy"
+        $InternalExitCode = $INTERNAL_WU_BUSY
+        throw "Windows Update stayed busy."
+    }
+
+    Write-Log ("Installing {0} update(s)..." -f $UpdatesToInstall.Count) "INFO"
+
+    $Installer = $Session.CreateUpdateInstaller()
+    $Installer.Updates = $UpdatesToInstall
+    $Installer.AllowSourcePrompts = $false
+    $ComObjects.Add($Installer)
+
+    try
+    {
+        $Installer.ForceQuiet = $true
+    }
+    catch
+    {
+    }
+
+    $InstallStart = Get-Date
+    $InstallResult = $Installer.Install()
+    $Duration = (Get-Date) - $InstallStart
+
+    Write-Log ("Install done in {0}s - {1}" -f [math]::Round($Duration.TotalSeconds), (Get-WUResultText -Code $InstallResult.ResultCode)) "INFO"
+
+    $Results = [Collections.Generic.List[PSCustomObject]]::new()
+
+    for ($Index = 0; $Index -lt $UpdatesToInstall.Count; $Index++)
+    {
+        $Update = $UpdatesToInstall.Item($Index)
+        $UpdateResult = $InstallResult.GetUpdateResult($Index)
+        $RebootRequired = $UpdateResult.RebootRequired
+
+        if ($UpdateResult.ResultCode -in @(2, 3))
+        {
+            $InstallSuccess++
+
+            if ($RebootRequired)
+            {
+                $RebootCount++
+            }
+
+            Write-Log ("  INSTALLED ({0}): {1}" -f $(if ($RebootRequired) { 'reboot-pending' } else { 'no-reboot' }), $Update.Title) "SUCCESS"
+        }
+        else
+        {
+            $InstallFail++
+            Write-Log ("  FAILED: {0} - 0x{1}" -f $Update.Title, $UpdateResult.HResult.ToString('X8')) "ERROR"
+        }
+
+        $Results.Add(
+            [PSCustomObject]@{
+                Title = $Update.Title
+                Result = Get-WUResultText -Code $UpdateResult.ResultCode
+                RebootRequired = $RebootRequired
+                HResult = "0x$($UpdateResult.HResult.ToString('X8'))"
+            }
+        )
+    }
+
+    $PendingReboot = Test-PendingReboot
+    $EffectiveReboot = $InstallResult.RebootRequired -or $PendingReboot.Pending
+
+    Write-Log ("SUMMARY | Installed: {0} | Already: {1} | Failed: {2} | RebootPending: {3}" -f $InstallSuccess, $AlreadyInstalled, $InstallFail, $RebootCount) "INFO"
+    Write-Log ("EffectiveReboot: {0} (reasons: {1})" -f $EffectiveReboot, ($PendingReboot.Reasons -join ', ')) "INFO"
+
+    if ($InstallFail -gt 0 -and $InstallSuccess -eq 0)
+    {
+        $Status = "Failed"
+        $InternalExitCode = $INTERNAL_TOTAL_FAIL
+    }
+    elseif ($InstallFail -gt 0)
+    {
+        $Status = "Partial"
+        $InternalExitCode = $INTERNAL_PARTIAL
+    }
+    else
+    {
+        $Status = "Success"
+        $InternalExitCode = $INTERNAL_SUCCESS
+    }
+
+    Write-RunSummary @{
+        Script = $ScriptName
+        Version = $ScriptVersion
+        Mode = $Mode
+        Status = $Status
+        Installed = $InstallSuccess
+        Already = $AlreadyInstalled
+        Failed = $InstallFail
+        RebootPending = $RebootCount
+        RebootRequired = $EffectiveReboot
+        DurSec = [math]::Round($Duration.TotalSeconds)
+        Results = @($Results)
+        ExitCode = $InternalExitCode
+        Timestamp = (Get-Date).ToString("o")
+    }
+
+    if ($InstallSuccess -gt 0)
+    {
+        if ($UserInitiated)
+        {
+            Write-Log "UserInitiated: cleanup and restart." "INFO"
+            Remove-Infrastructure
+            Send-UserToast -Title "Driver Updates" -Body "$InstallSuccess driver update(s) installed. Restarting in $RestartDelaySec seconds. Please save your work." -Suffix "PreRestart"
+            & shutdown.exe /r /t $RestartDelaySec /c "$InstallSuccess driver update(s) installed." /d p:2:17
+            Write-Log ("Restart scheduled ({0} sec)." -f $RestartDelaySec) "SUCCESS"
+        }
+        else
+        {
+            Write-Log "AtStartup: evaluating reboot." "INFO"
+
+            if ($EffectiveReboot)
+            {
+                Write-Log ("Reboot required for {0} update(s)." -f $RebootCount) "WARN"
+
+                @{
+                    Status = "RebootPendingAfterInstall"
+                    InstalledThisRun = $InstallSuccess
+                    StillNeedReboot = $RebootCount
+                    ComputerName = $env:COMPUTERNAME
+                    UpdatedAt = (Get-Date).ToString("o")
+                } |
+                    ConvertTo-Json -Depth 10 | Out-File $MarkerPath -Encoding UTF8 -Force
+
+                if (Test-Path $ManifestPath)
+                {
+                    Remove-Item $ManifestPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "Manifest cleared." "INFO"
+                }
+
+                try
+                {
+                    Start-ScheduledTask -TaskName $ToastTaskName -ErrorAction Stop
+                    Write-Log "Toast kicked." "INFO"
+                }
+                catch
+                {
+                    Write-Log ("Toast kick failed: {0}" -f $_.Exception.Message) "WARN"
+                }
+            }
+            else
+            {
+                Write-Log "No reboot required. Cleaning up." "SUCCESS"
+                Remove-Infrastructure
+                Send-UserToast -Title "Driver Updates" -Body "$InstallSuccess driver update(s) installed. No restart needed." -Suffix "Complete"
+            }
+        }
+    }
+    elseif ($AlreadyInstalled -gt 0 -and $InstallFail -eq 0)
+    {
+        Write-Log "All already installed. Cleaning up." "SUCCESS"
+        Remove-Infrastructure
+    }
+    else
+    {
+        Write-Log "Install failed or no match. Retaining infrastructure." "WARN"
+    }
+}
+catch
+{
+    Write-Log ("ERROR: {0}" -f $_.Exception.Message) "ERROR"
+
+    if ($_.ScriptStackTrace)
+    {
+        Write-Log ("Stack: {0}" -f $_.ScriptStackTrace) "ERROR"
+    }
+
+    if ($InternalExitCode -eq $INTERNAL_SUCCESS)
+    {
+        $InternalExitCode = $INTERNAL_CRITICAL
+    }
+
+    if ($Status -eq "Unknown")
+    {
+        $Status = "CriticalFailure"
+    }
+
+    Write-RunSummary @{
+        Script = $ScriptName
+        Version = $ScriptVersion
+        Status = $Status
+        Error = $_.Exception.Message
+        ExitCode = $InternalExitCode
+        Timestamp = (Get-Date).ToString("o")
+    }
+}
+finally
+{
+    if ($ComObjects.Count -gt 0)
+    {
+        Clear-ComObjects -Objects $ComObjects
+    }
+
+    Remove-LockFile
+    Write-Log ("Exit: {0}" -f $InternalExitCode) "INFO"
+    [Environment]::Exit($InternalExitCode)
+}
+'@
+    Set-Content -Path $InstallerScriptPath -Value $Content -Encoding UTF8 -Force
+    $FileSize = (Get-Item -Path $InstallerScriptPath).Length
+    Write-Log ("Installer script written: {0} ({1} bytes, v3.5.5 embedded)" -f (Split-Path $InstallerScriptPath -Leaf), $FileSize) "SUCCESS"
+}
+
+function Write-ToastScript
+{
+    $Content = @'
+<#
+.SYNOPSIS
+    Shows an adaptive Windows toast notification for i3 driver updates.
+
+.DESCRIPTION
+    Reads local state files to determine whether to present an install/restart
+    notification to the interactive user. Handles the button click in-process
+    via the Activated event so no custom protocol handler is required.
+
+.AUTHOR
+    Ken Kruis
+
+.VERSION
+    1.4.0
+#>
+
+[CmdletBinding()]
+param
+(
+    [string]$BasePath = "C:\ProgramData\i3",
+    [int]$LogRetentionDays = 30,
+    [switch]$EnableWpfFallback = $true,
+    [switch]$Silent
+)
+
+$ScriptName = "Show-DriverUpdateToast"
+$ScriptVersion = "1.4.0"
+$RunStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+$LogPath = Join-Path $BasePath "logs"
+$UserStatePath = Join-Path $BasePath "UserState"
+$ConfigPath = Join-Path $BasePath "DriverUpdateToast.config.json"
+$ManifestPath = Join-Path $BasePath "DriverUpdateManifest.json"
+$MarkerPath = Join-Path $BasePath "DriverUpdate_RebootRequired.marker.json"
+$StatusPath = Join-Path $UserStatePath "DriverUpdateToast.status.json"
+$HeartbeatPath = Join-Path $UserStatePath "DriverUpdateToast.started.txt"
+$LogFile = Join-Path $UserStatePath "${ScriptName}_${RunStamp}.log"
+
+$ToastAppId = "i3ITManagement.DriverUpdate"
+$ToastAppDisplayName = "Business Solutions"
+$InstallTaskName = "i3_DriverInstallAndRestart"
+
+$Caption = "i3 Updates Available"
+$Mode = $null
+$BodyText = ""
+$PrimaryBtnText = ""
+$UpdateCount = 0
+
+$Status = [ordered]@{
+    ScriptName = $ScriptName
+    ScriptVersion = $ScriptVersion
+    ComputerName = $env:COMPUTERNAME
+    UserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    StartedAt = (Get-Date).ToString("o")
+    CompletedAt = $null
+    Caption = $Caption
+    Mode = $null
+    ManifestFound = $false
+    MarkerFound = $false
+    ManifestUpdateCount = 0
+    AppIdRegistered = $false
+    ToastAttempted = $false
+    ToastShowCallSucceeded = $false
+    ToastActivated = $false
+    ToastDismissed = $false
+    WpfFallbackAttempted = $false
+    WpfFallbackShown = $false
+    ActionableStateFound = $false
+    ExitReason = $null
+    Error = $null
+}
+
+function Write-Log
+{
+    param
+    (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $Line = "{0} [{1}] {2}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Level.ToUpper(), $Message
+
+    if (-not $Silent)
+    {
+        Write-Host $Line
+    }
+
+    try
+    {
+        if (-not (Test-Path -Path $UserStatePath))
+        {
+            New-Item -Path $UserStatePath -ItemType Directory -Force | Out-Null
+        }
+
+        Add-Content -Path $LogFile -Value $Line -ErrorAction Stop
+    }
+    catch
+    {
+    }
+}
+
+function Write-Status
+{
+    try
+    {
+        $Status.CompletedAt = (Get-Date).ToString("o")
+        $Status | ConvertTo-Json -Depth 10 | Out-File -FilePath $StatusPath -Encoding UTF8 -Force
+    }
+    catch
+    {
+    }
+}
+
+function Write-Heartbeat
+{
+    try
+    {
+        if (-not (Test-Path -Path $UserStatePath))
+        {
+            New-Item -Path $UserStatePath -ItemType Directory -Force | Out-Null
+        }
+
+        $Content = "Started: $(Get-Date -Format 'o')`nScript: $ScriptName v$ScriptVersion`nUser: $($Status.UserName)`nComputer: $($Status.ComputerName)"
+        Set-Content -Path $HeartbeatPath -Value $Content -Encoding UTF8 -Force
+    }
+    catch
+    {
+    }
+}
+
+function Remove-OldLogs
+{
+    try
+    {
+        if (-not (Test-Path -Path $UserStatePath))
+        {
+            return
+        }
+
+        $Cutoff = (Get-Date).AddDays(-$LogRetentionDays)
+
+        Get-ChildItem -Path $UserStatePath -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $Cutoff } |
+            ForEach-Object { Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    catch
+    {
+    }
+}
+
+function Set-ExitState
+{
+    param
+    (
+        [string]$Reason,
+        [string]$ErrorMessage = $null
+    )
+
+    $Status.ExitReason = $Reason
+
+    if ($ErrorMessage)
+    {
+        $Status.Error = $ErrorMessage
+    }
+
+    Write-Status
+}
+
+function Register-ToastAppId
+{
+    param
+    (
+        [string]$AppId,
+        [string]$DisplayName
+    )
+
+    try
+    {
+        $HkcuPath = "HKCU:\SOFTWARE\Classes\AppUserModelId\$AppId"
+
+        if (-not (Test-Path -Path $HkcuPath))
+        {
+            New-Item -Path $HkcuPath -Force | Out-Null
+        }
+
+        Set-ItemProperty -Path $HkcuPath -Name "DisplayName" -Value $DisplayName -Force
+        Set-ItemProperty -Path $HkcuPath -Name "ShowInSettings" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $HkcuPath -Name "ShowInActionCenter" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $HkcuPath -Name "AllowContentAboveLock" -Value 0 -Type DWord -Force
+
+        try
+        {
+            $HklmPath = "HKLM:\SOFTWARE\Classes\AppUserModelId\$AppId"
+
+            if (-not (Test-Path -Path $HklmPath))
+            {
+                New-Item -Path $HklmPath -Force | Out-Null
+            }
+
+            Set-ItemProperty -Path $HklmPath -Name "DisplayName" -Value $DisplayName -Force
+            Set-ItemProperty -Path $HklmPath -Name "ShowInSettings" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $HklmPath -Name "ShowInActionCenter" -Value 1 -Type DWord -Force
+            Set-ItemProperty -Path $HklmPath -Name "IconUri" -Value "C:\ProgramData\i3\branding\i3_CharmOnly_150x150_toast.png" -Force
+        }
+        catch
+        {
+            Write-Log ("HKLM AppId write skipped: {0}" -f $_.Exception.Message) "INFO"
+        }
+
+        $NotifPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Notifications\Settings\$AppId"
+
+        if (-not (Test-Path -Path $NotifPath))
+        {
+            New-Item -Path $NotifPath -Force | Out-Null
+        }
+
+        $Existing = Get-ItemProperty -Path $NotifPath -Name "Enabled" -ErrorAction SilentlyContinue
+
+        if ($null -eq $Existing -or $Existing.Enabled -ne 1)
+        {
+            Set-ItemProperty -Path $NotifPath -Name "Enabled" -Value 1 -Type DWord -Force
+            Write-Log ("Notification setting Enabled set to 1 for AppId: {0}" -f $AppId) "INFO"
+        }
+
+        Write-Log ("AppId registered: {0} ({1})" -f $AppId, $DisplayName) "SUCCESS"
+        return $true
+    }
+    catch
+    {
+        Write-Log ("AppId registration failed: {0}" -f $_.Exception.Message) "WARN"
+        return $false
+    }
+}
+
+function Invoke-InstallTask
+{
+    $Triggered = $false
+
+    # Try COM first
+    $Sched   = $null
+    $Folder  = $null
+    $TaskObj = $null
+
+    try
+    {
+        Write-Log ("Attempting COM task trigger: {0}" -f $InstallTaskName) "INFO"
+        $Sched   = New-Object -ComObject Schedule.Service
+        $Sched.Connect()
+        $Folder  = $Sched.GetFolder("\")
+        $TaskObj = $Folder.GetTask($InstallTaskName)
+        $null    = $TaskObj.Run($null)
+        $Triggered = $true
+        Write-Log "COM task trigger succeeded." "SUCCESS"
+    }
+    catch
+    {
+        Write-Log ("COM task trigger failed: {0}" -f $_.Exception.Message) "WARN"
+    }
+    finally
+    {
+        foreach ($Obj in @($TaskObj, $Folder, $Sched))
+        {
+            if ($Obj)
+            {
+                try { [Runtime.InteropServices.Marshal]::ReleaseComObject($Obj) | Out-Null } catch { }
+            }
+        }
+    }
+
+    # schtasks.exe fallback
+    if (-not $Triggered)
+    {
+        try
+        {
+            Write-Log "Trying schtasks.exe fallback." "WARN"
+            $Output   = & schtasks.exe /Run /TN "\$InstallTaskName" 2>&1
+            $ExitCode = $LASTEXITCODE
+            $Output | ForEach-Object { Write-Log ("schtasks: {0}" -f $_) "INFO" }
+
+            if ($ExitCode -eq 0)
+            {
+                $Triggered = $true
+                Write-Log "schtasks.exe trigger succeeded." "SUCCESS"
+            }
+            else
+            {
+                Write-Log ("schtasks.exe exit code: {0}" -f $ExitCode) "ERROR"
+            }
+        }
+        catch
+        {
+            Write-Log ("schtasks.exe fallback failed: {0}" -f $_.Exception.Message) "ERROR"
+        }
+    }
+
+    if (-not $Triggered)
+    {
+        Write-Log "All trigger methods failed." "ERROR"
+    }
+
+    return $Triggered
+}
+
+function Show-WpfFallback
+{
+    param
+    (
+        [string]$WindowTitle,
+        [string]$MessageText,
+        [string]$ButtonText
+    )
+
+    $Status.WpfFallbackAttempted = $true
+    Write-Log "Attempting WPF fallback popup." "WARN"
+
+    try
+    {
+        Add-Type -AssemblyName PresentationFramework -ErrorAction Stop
+        Add-Type -AssemblyName PresentationCore -ErrorAction Stop
+        Add-Type -AssemblyName WindowsBase -ErrorAction Stop
+
+        $Xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        Title="$([Security.SecurityElement]::Escape($WindowTitle))"
+        Height="240"
+        Width="460"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="NoResize"
+        Topmost="True"
+        ShowInTaskbar="True">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Text="$([Security.SecurityElement]::Escape($WindowTitle))" FontSize="20" FontWeight="Bold" Margin="0,0,0,12" TextWrapping="Wrap" />
+        <TextBlock Grid.Row="1" Text="$([Security.SecurityElement]::Escape($MessageText))" FontSize="14" TextWrapping="Wrap" VerticalAlignment="Top" />
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
+            <Button Name="LaterButton" Width="110" Height="34" Margin="0,0,10,0" Content="Later" />
+            <Button Name="ActionButton" Width="180" Height="34" Content="$([Security.SecurityElement]::Escape($ButtonText))" />
+        </StackPanel>
+    </Grid>
+</Window>
+"@
+
+        $Reader = New-Object System.Xml.XmlNodeReader ([xml]$Xaml)
+        $Window = [Windows.Markup.XamlReader]::Load($Reader)
+        $LaterButton  = $Window.FindName("LaterButton")
+        $ActionButton = $Window.FindName("ActionButton")
+
+        $LaterButton.Add_Click({
+            $Window.Tag = "Later"
+            $Window.Close()
+        })
+
+        $ActionButton.Add_Click({
+            $Window.Tag = "Action"
+            $Window.Close()
+        })
+
+        $null = $Window.ShowDialog()
+        $Status.WpfFallbackShown = $true
+        Write-Log "WPF fallback popup displayed and closed." "SUCCESS"
+
+        if ($Window.Tag -eq "Action")
+        {
+            Write-Log "User clicked action in WPF fallback." "SUCCESS"
+            Invoke-InstallTask | Out-Null
+        }
+        else
+        {
+            Write-Log "User dismissed WPF fallback with Later." "INFO"
+        }
+
+        return $true
+    }
+    catch
+    {
+        Write-Log ("WPF fallback failed: {0}" -f $_.Exception.Message) "ERROR"
+        return $false
+    }
+}
+
+try
+{
+    Remove-OldLogs
+
+    foreach ($Directory in @($BasePath, $UserStatePath))
+    {
+        if (-not (Test-Path -Path $Directory))
+        {
+            New-Item -Path $Directory -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    Write-Heartbeat
+
+    Write-Log "============================================================" "INFO"
+    Write-Log ("Script: {0} v{1}" -f $ScriptName, $ScriptVersion) "INFO"
+    Write-Log ("Computer: {0}" -f $env:COMPUTERNAME) "INFO"
+    Write-Log ("User: {0}" -f [Security.Principal.WindowsIdentity]::GetCurrent().Name) "INFO"
+    Write-Log ("AppId: {0}" -f $ToastAppId) "INFO"
+    Write-Log "============================================================" "INFO"
+
+    $AppIdOk = Register-ToastAppId -AppId $ToastAppId -DisplayName $ToastAppDisplayName
+    $Status.AppIdRegistered = $AppIdOk
+
+    if (Test-Path -Path $ConfigPath)
+    {
+        try
+        {
+            $Config = Get-Content -Path $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
+
+            if ($Config.Caption)
+            {
+                $Caption = [string]$Config.Caption
+                $Status.Caption = $Caption
+            }
+
+            Write-Log ("Config loaded. Caption: '{0}'" -f $Caption) "INFO"
+        }
+        catch
+        {
+            Write-Log ("Config read failed: {0}" -f $_.Exception.Message) "WARN"
+        }
+    }
+    else
+    {
+        Write-Log "Config not found - using default caption." "INFO"
+    }
+
+    if (Test-Path -Path $ManifestPath)
+    {
+        $Status.ManifestFound = $true
+        Write-Log ("Manifest found: {0}" -f $ManifestPath) "INFO"
+
+        try
+        {
+            $Manifest = Get-Content -Path $ManifestPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $UpdateCount = if ($Manifest.Updates) { @($Manifest.Updates).Count } else { 0 }
+            $Status.ManifestUpdateCount = $UpdateCount
+            Write-Log ("Manifest update count: {0}" -f $UpdateCount) "INFO"
+
+            if ($UpdateCount -gt 0)
+            {
+                $Mode = "Install"
+                $BodyText = "$UpdateCount driver/firmware update(s) have been downloaded and are ready to install. Your computer will need to restart."
+                $PrimaryBtnText = "Install & Restart Now"
+            }
+        }
+        catch
+        {
+            Write-Log ("Manifest parse failed: {0}" -f $_.Exception.Message) "WARN"
+        }
+    }
+    else
+    {
+        Write-Log "Manifest not found." "INFO"
+    }
+
+    if ((-not $Mode) -and (Test-Path -Path $MarkerPath))
+    {
+        $Status.MarkerFound = $true
+        Write-Log ("Marker found: {0}" -f $MarkerPath) "INFO"
+
+        try
+        {
+            $Marker = Get-Content -Path $MarkerPath -Raw -ErrorAction Stop | ConvertFrom-Json
+
+            if ($Marker.Status -eq "RebootPendingAfterInstall")
+            {
+                $InstalledValue = if ($Marker.PSObject.Properties.Name -contains "InstalledThisRun" -and $Marker.InstalledThisRun) { [string]$Marker.InstalledThisRun } else { "Some" }
+                $PendingValue   = if ($Marker.PSObject.Properties.Name -contains "StillNeedReboot"  -and $Marker.StillNeedReboot)  { [string]$Marker.StillNeedReboot  } else { "some" }
+                $Mode = "Restart"
+                $BodyText = "$InstalledValue driver update(s) were installed, but $PendingValue still need a restart to finish."
+                $PrimaryBtnText = "Restart Now"
+            }
+            else
+            {
+                Write-Log ("Marker status '{0}' is not actionable." -f $Marker.Status) "INFO"
+            }
+        }
+        catch
+        {
+            Write-Log ("Marker parse failed: {0}" -f $_.Exception.Message) "WARN"
+        }
+    }
+    else
+    {
+        if (-not (Test-Path -Path $MarkerPath))
+        {
+            Write-Log "Marker not found." "INFO"
+        }
+    }
+
+    if (-not $Mode)
+    {
+        $Status.ActionableStateFound = $false
+        $Status.Mode = "None"
+        Write-Log "No actionable state found. Exiting without notification." "INFO"
+        Set-ExitState -Reason "NoActionableState"
+        exit 0
+    }
+
+    $Status.ActionableStateFound = $true
+    $Status.Mode = $Mode
+
+    Write-Log ("Mode: {0} | Button: {1}" -f $Mode, $PrimaryBtnText) "SUCCESS"
+    Write-Log ("Body: {0}" -f $BodyText) "INFO"
+
+    try
+    {
+        $Status.ToastAttempted = $true
+
+        $null = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        $null = [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+
+        # activationType="foreground" delivers the click back to this process
+        # via the Activated event rather than launching an external handler.
+        # This is reliable from toast context where custom protocols are blocked.
+        $ToastXml = @"
+<toast duration="long" scenario="reminder">
+    <visual>
+        <binding template="ToastGeneric">
+            <image placement="appLogoOverride" src="file:///C:/ProgramData/i3/branding/i3_CharmOnly_150x150_toast.png" hint-crop="circle"/>
+            <text>$([Security.SecurityElement]::Escape($Caption))</text>
+            <text>$([Security.SecurityElement]::Escape($BodyText))</text>
+            <text placement="attribution">Business Solutions</text>
+        </binding>
+    </visual>
+    <actions>
+        <action content="$([Security.SecurityElement]::Escape($PrimaryBtnText))" activationType="foreground" arguments="action=install"/>
+        <action content="Later" activationType="system" arguments="dismiss"/>
+    </actions>
+    <audio src="ms-winsoundevent:Notification.Reminder"/>
+</toast>
+"@
+
+        $XmlDoc = [Windows.Data.Xml.Dom.XmlDocument]::new()
+        $XmlDoc.LoadXml($ToastXml)
+
+        $Toast = [Windows.UI.Notifications.ToastNotification]::new($XmlDoc)
+
+        $script:ToastActivated = $false
+        $script:ToastDismissed = $false
+
+        $Toast.add_Activated({
+            $script:ToastActivated = $true
+            $Status.ToastActivated = $true
+            Write-Log "Toast button activated - triggering install task." "SUCCESS"
+            Invoke-InstallTask | Out-Null
+        })
+
+        $Toast.add_Dismissed({
+            $script:ToastDismissed = $true
+            $Status.ToastDismissed = $true
+            Write-Log "Toast dismissed by user." "INFO"
+        })
+
+        $Toast.add_Failed({
+            $script:ToastDismissed = $true
+            Write-Log "Toast Failed event fired." "WARN"
+        })
+
+        Write-Log ("Calling CreateToastNotifier('{0}').Show()..." -f $ToastAppId) "INFO"
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($ToastAppId).Show($Toast)
+        $Status.ToastShowCallSucceeded = $true
+        Write-Log "Toast Show() returned - waiting for user action (up to 10 min)." "SUCCESS"
+
+        # Keep process alive so the Activated event can fire.
+        # The scheduled task will show as Running until the user acts or the deadline passes.
+        $Deadline = (Get-Date).AddMinutes(10)
+        while (-not $script:ToastActivated -and -not $script:ToastDismissed -and (Get-Date) -lt $Deadline)
+        {
+            Start-Sleep -Seconds 2
+        }
+
+        $WaitOutcome = if ($script:ToastActivated) { "UserClickedInstall" } elseif ($script:ToastDismissed) { "UserDismissed" } else { "WaitTimeout" }
+        Write-Log ("Wait complete. Activated={0} Dismissed={1} Outcome={2}" -f $script:ToastActivated, $script:ToastDismissed, $WaitOutcome) "INFO"
+        Set-ExitState -Reason $WaitOutcome
+        exit 0
+    }
+    catch
+    {
+        $ErrorMessage = $_.Exception.Message
+        Write-Log ("Toast display failed: {0}" -f $ErrorMessage) "ERROR"
+
+        if ($EnableWpfFallback)
+        {
+            $FallbackShown = Show-WpfFallback -WindowTitle $Caption -MessageText $BodyText -ButtonText $PrimaryBtnText
+
+            if ($FallbackShown)
+            {
+                Set-ExitState -Reason "ToastFailed_WpfFallbackShown" -ErrorMessage $ErrorMessage
+                exit 0
+            }
+        }
+
+        Set-ExitState -Reason "ToastFailed_NoFallbackShown" -ErrorMessage $ErrorMessage
+        exit 0
+    }
+}
+catch
+{
+    $FatalError = $_.Exception.Message
+    Write-Log ("Unhandled failure: {0}" -f $FatalError) "ERROR"
+    Set-ExitState -Reason "UnhandledFailure" -ErrorMessage $FatalError
+    exit 0
+}
+'@
+    Set-Content -Path $ToastScriptPath -Value $Content -Encoding UTF8 -Force
+    $FileSize = (Get-Item -Path $ToastScriptPath).Length
+    Write-Log ("Toast script written: {0} ({1} bytes, v1.4.0 embedded)" -f (Split-Path $ToastScriptPath -Leaf), $FileSize) "SUCCESS"
+}
+
+# ============================================================
+# BRANDING
+# ============================================================
+function Download-BrandingAssets
+{
+    try
+    {
+        if (-not (Test-Path -Path $BrandingPath)) { New-Item -Path $BrandingPath -ItemType Directory -Force | Out-Null }
+        if (Test-Path -Path $LogoLocalPath) { Write-Log ("Branding logo already present: {0}" -f $LogoFileName) "INFO"; return $true }
+        Write-Log ("Downloading branding logo: {0}" -f $LogoFileName) "INFO"
+        $WebClient = New-Object System.Net.WebClient
+        $WebClient.DownloadFile($LogoUrl, $LogoLocalPath)
+        $WebClient.Dispose()
+        if (Test-Path -Path $LogoLocalPath) { Write-Log ("Branding logo saved: {0}" -f $LogoLocalPath) "SUCCESS"; return $true }
+        Write-Log "Branding logo download appeared to succeed but file not found." "WARN"
+        return $false
+    }
+    catch
+    {
+        Write-Log ("Branding logo download failed: {0}" -f $_.Exception.Message) "WARN"
+        return $false
+    }
+}
+
+# ============================================================
+# INFRASTRUCTURE
+# ============================================================
+function Register-EventLogSource
+{
+    try
+    {
+        if (-not [Diagnostics.EventLog]::SourceExists($EventLogSource)) { [Diagnostics.EventLog]::CreateEventSource($EventLogSource, $EventLogName) }
+        return $true
+    }
+    catch { Write-Log ("EventLog source failed: {0}" -f $_.Exception.Message) "ERROR"; return $false }
+}
+
+function Register-ProtocolRegistry
+{
+    try
+    {
+        $RegistryPath = "HKLM:\SOFTWARE\Classes\$ProtocolName"
+
+        # Wipe any prior registration so stale values from older versions cannot persist.
+        if (Test-Path -Path $RegistryPath) { Remove-Item -Path $RegistryPath -Recurse -Force -ErrorAction SilentlyContinue }
+
+        New-Item -Path $RegistryPath -Force | Out-Null
+        Set-ItemProperty -Path $RegistryPath -Name "(Default)"  -Value "URL:i3 Driver Update Protocol"
+        Set-ItemProperty -Path $RegistryPath -Name "URL Protocol" -Value ""
+
+        # EditFlags = 0x02 (FTA_OpenIsSafe): tells Windows the protocol is safe
+        # to launch from toast/notification context without silent blocking.
+        Set-ItemProperty -Path $RegistryPath -Name "EditFlags" -Value 2 -Type DWord
+
+        # DefaultIcon subkey is required by some Windows 10/11 builds for
+        # protocol activation via the notification platform.
+        New-Item -Path "$RegistryPath\DefaultIcon" -Force | Out-Null
+        Set-ItemProperty -Path "$RegistryPath\DefaultIcon" -Name "(Default)" -Value "powershell.exe,0"
+
+        New-Item -Path "$RegistryPath\shell\open\command" -Force | Out-Null
+
+        # FIX v5.9.1: No cmd.exe /c wrapper. ShellExecute diagnostic confirmed
+        # that the cmd wrapper prevented the handler from ever executing (no log
+        # files were produced even via Start-Process from the standard user).
+        # PowerShell consumes %1 cleanly via the named -ProtocolArg parameter.
+        $Command = 'powershell.exe -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $ProtocolHandlerPath + '" -ProtocolArg "%1"'
+        Set-ItemProperty -Path "$RegistryPath\shell\open\command" -Name "(Default)" -Value $Command
+        Write-Log ("Protocol command registered: {0}" -f $Command) "INFO"
+
+        # Read-back: confirms exactly what landed in the registry.
+        try
+        {
+            $ReadBack = (Get-ItemProperty -Path "$RegistryPath\shell\open\command" -Name "(Default)" -ErrorAction Stop).'(default)'
+            Write-Log ("Protocol command read-back: {0}" -f $ReadBack) "INFO"
+        }
+        catch { Write-Log ("Protocol command read-back failed: {0}" -f $_.Exception.Message) "WARN" }
+
+        return $true
+    }
+    catch { Write-Log ("Protocol registry failed: {0}" -f $_.Exception.Message) "ERROR"; return $false }
+}
+
+function Register-InstallTask
+{
+    try
+    {
+        $ExistingTask = Get-ScheduledTask -TaskName $InstallTaskName -ErrorAction SilentlyContinue
+        if ($ExistingTask) { Unregister-ScheduledTask -TaskName $InstallTaskName -Confirm:$false -ErrorAction Stop }
+
+        $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallerScriptPath`" -UserInitiated"
+        $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances Queue -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+
+        Register-ScheduledTask -TaskName $InstallTaskName -Action $Action -Principal $Principal -Settings $Settings -Force | Out-Null
+
+        $Verify = Get-ScheduledTask -TaskName $InstallTaskName -ErrorAction SilentlyContinue
+        if (-not $Verify) { Write-Log "Install task not found after registration." "ERROR"; return $false }
+
+        try
+        {
+            $Scheduler  = New-Object -ComObject Schedule.Service
+            $Scheduler.Connect()
+            $TaskFolder = $Scheduler.GetFolder("\")
+            $TaskObj    = $TaskFolder.GetTask($InstallTaskName)
+            $Sddl       = $TaskObj.GetSecurityDescriptor(0xF)
+
+            Write-Log ("Install task original SDDL: {0}" -f $Sddl) "INFO"
+
+            $AceList = @(
+                @{ SidName = "BUILTIN\Users";        SddlSid = "BU"; Ace = "(A;;GRGX;;;BU)" },
+                @{ SidName = "Authenticated Users";  SddlSid = "AU"; Ace = "(A;;GRGX;;;AU)" },
+                @{ SidName = "Interactive Users";    SddlSid = "IU"; Ace = "(A;;GRGX;;;IU)" }
+            )
+
+            $NewSddl = $Sddl
+            $Changed = $false
+
+            foreach ($AceItem in $AceList)
+            {
+                if ($NewSddl -notmatch "\([A-Z];;[^)]*;;;$($AceItem.SddlSid)\)")
+                {
+                    $NewSddl += $AceItem.Ace
+                    $Changed  = $true
+                    Write-Log ("Prepared task permission ACE for {0}: {1}" -f $AceItem.SidName, $AceItem.Ace) "INFO"
+                }
+                else { Write-Log ("Task permission ACE already present for {0}." -f $AceItem.SidName) "INFO" }
+            }
+
+            if ($Changed)
+            {
+                $TaskObj.SetSecurityDescriptor($NewSddl, [int32]0)
+                Write-Log "Updated install task security descriptor for standard-user trigger support." "SUCCESS"
+            }
+            else { Write-Log "Install task security descriptor already had required ACEs." "INFO" }
+
+            Write-Log ("Install task SDDL after update: {0}" -f $TaskObj.GetSecurityDescriptor(0xF)) "INFO"
+
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($TaskObj)    | Out-Null
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($TaskFolder) | Out-Null
+            [Runtime.InteropServices.Marshal]::ReleaseComObject($Scheduler)  | Out-Null
+        }
+        catch { Write-Log ("Install task SDDL grant failed: {0}" -f $_.Exception.Message) "WARN" }
+
+        Write-Log ("Install task: {0} (SYSTEM, Queue, -UserInitiated) -- VERIFIED" -f $InstallTaskName) "SUCCESS"
+        return $true
+    }
+    catch { Write-Log ("Install task failed: {0}" -f $_.Exception.Message) "ERROR"; return $false }
+}
+
+function Register-BootFallbackTask
+{
+    try
+    {
+        $ExistingTask = Get-ScheduledTask -TaskName $BootTaskName -ErrorAction SilentlyContinue
+        if ($ExistingTask) { Unregister-ScheduledTask -TaskName $BootTaskName -Confirm:$false -ErrorAction Stop }
+
+        $Action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$InstallerScriptPath`""
+        $Trigger   = New-ScheduledTaskTrigger -AtStartup
+        $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -StartWhenAvailable
+
+        Register-ScheduledTask -TaskName $BootTaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force | Out-Null
+        Write-Log ("Boot fallback: {0} (AtStartup)" -f $BootTaskName) "SUCCESS"
+        return $true
+    }
+    catch { Write-Log ("Boot fallback failed: {0}" -f $_.Exception.Message) "ERROR"; return $false }
+}
+
+function Register-ToastTask
+{
+    try
+    {
+        $ExistingTask = Get-ScheduledTask -TaskName $ToastTaskName -ErrorAction SilentlyContinue
+        if ($ExistingTask) { Unregister-ScheduledTask -TaskName $ToastTaskName -Confirm:$false -ErrorAction Stop }
+
+        $User = Get-ActiveConsoleUser
+        if (-not $User)
+        {
+            Write-Log "No interactive user - toast task will fire at next logon." "WARN"
+            $Principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
+        }
+        else
+        {
+            Write-Log ("Toast task for: {0}" -f $User) "INFO"
+            $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+        }
+
+        $Action      = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ToastScriptPath`""
+        $RepeatStart = (Get-Date).AddSeconds($SnoozeSeconds)
+        $Trigger1    = New-ScheduledTaskTrigger -Once -At $RepeatStart -RepetitionInterval (New-TimeSpan -Seconds $SnoozeSeconds) -RepetitionDuration (New-TimeSpan -Days $NotifyMaxDays)
+        $Trigger2    = New-ScheduledTaskTrigger -AtLogOn
+        $Settings    = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -Hidden
+
+        Register-ScheduledTask -TaskName $ToastTaskName -Action @($Action) -Trigger @($Trigger1, $Trigger2) -Principal $Principal -Settings $Settings -Force | Out-Null
+        Write-Log ("Toast task: {0} (repeat every {1}h for {2}d + AtLogOn)" -f $ToastTaskName, ($SnoozeSeconds / 3600), $NotifyMaxDays) "SUCCESS"
+        return $true
+    }
+    catch { Write-Log ("Toast task failed: {0}" -f $_.Exception.Message) "WARN"; return $false }
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+$ComObjects       = [Collections.Generic.List[object]]::new()
+$InternalExitCode = $INTERNAL_SUCCESS
+$DownloadedCount  = 0
+
+try
+{
+    Initialize-i3Folders | Out-Null
+    Remove-OldLogs
+
+    Write-Log "============================================================" "INFO"
+    Write-Log ("Script: {0} v{1}" -f $ScriptName, $ScriptVersion) "INFO"
+    Write-Log ("Computer: {0} | User: {1}" -f $env:COMPUTERNAME, [Security.Principal.WindowsIdentity]::GetCurrent().Name) "INFO"
+    Write-Log ("BasePath: {0}" -f $BasePath) "INFO"
+    Write-Log ("LogPath: {0}" -f $LogPath) "INFO"
+    Write-Log ("UserStatePath: {0}" -f $UserStatePath) "INFO"
+    Write-Log ("Snooze: {0}h | MaxDays: {1} | Companion scripts: EMBEDDED v5.9.1" -f $NotifyIntervalHours, $NotifyMaxDays) "INFO"
+    Write-Log "============================================================" "INFO"
+
+    if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+    {
+        $InternalExitCode = $INTERNAL_NOT_ADMIN
+        throw "Not running as administrator."
+    }
+
+    Set-i3FolderPermissions | Out-Null
+
+    if (-not (New-LockFile))
+    {
+        Write-Output "EXIT: Already running"
+        [Environment]::Exit((Get-CWExitCode -Code $INTERNAL_ALREADY_RUNNING))
+    }
+
+    Remove-LegacyArtifacts
+
+    foreach ($Path in @($ToastStatusPath, $ToastHeartbeatPath, $ProtocolLogPath))
+    {
+        if (Test-Path -Path $Path) { Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue }
+    }
+
+    Write-InstallerScript
+    if (-not (Test-ScriptParse -FilePath $InstallerScriptPath)) { $InternalExitCode = $INTERNAL_WRITE_FAILED; throw "Installer parse check failed." }
+
+    Write-ToastScript
+    if (-not (Test-ScriptParse -FilePath $ToastScriptPath)) { $InternalExitCode = $INTERNAL_WRITE_FAILED; throw "Toast script parse check failed." }
+
+    Write-ToastConfig
+    Write-ProtocolHandler
+    if (-not (Test-ScriptParse -FilePath $ProtocolHandlerPath)) { $InternalExitCode = $INTERNAL_WRITE_FAILED; throw "Protocol handler parse check failed." }
+
+    $WUService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+    if (-not $WUService) { $InternalExitCode = $INTERNAL_WU_UNAVAILABLE; throw "Windows Update service not found." }
+    if ($WUService.Status -ne "Running") { Start-Service -Name wuauserv -ErrorAction SilentlyContinue; Start-Sleep -Seconds 3 }
+
+    $Session  = New-Object -ComObject Microsoft.Update.Session
+    $Searcher = $Session.CreateUpdateSearcher()
+    $ComObjects.Add($Session)
+    $ComObjects.Add($Searcher)
+
+    Write-Log "Scanning: IsInstalled=0 and Type='Driver'" "INFO"
+    $SearchResult = $Searcher.Search("IsInstalled=0 and Type='Driver'")
+    $UpdateCount  = $SearchResult.Updates.Count
+    Write-Log ("Found {0} applicable update(s)." -f $UpdateCount) "INFO"
+
+    if ($UpdateCount -eq 0)
+    {
+        Write-Log "No updates. System is current." "SUCCESS"
+        foreach ($TaskName in @($InstallTaskName, $BootTaskName, $ToastTaskName))
+        {
+            $Task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if ($Task) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue }
+        }
+        foreach ($FilePath in @($ManifestPath, $MarkerPath, $ProtocolHandlerPath, $ToastScriptPath, $ToastConfigPath, $ToastStatusPath, $ToastHeartbeatPath, $ProtocolLogPath))
+        {
+            if (Test-Path -Path $FilePath) { Remove-Item -Path $FilePath -Force -ErrorAction SilentlyContinue }
+        }
+        $ProtocolRegistryPath = "HKLM:\SOFTWARE\Classes\$ProtocolName"
+        if (Test-Path -Path $ProtocolRegistryPath) { Remove-Item -Path $ProtocolRegistryPath -Recurse -Force -ErrorAction SilentlyContinue }
+        Write-RunSummary @{ Status = "Success"; Reason = "No updates"; ExitCode = $INTERNAL_NO_UPDATES; Timestamp = (Get-Date).ToString("o") }
+        $InternalExitCode = $INTERNAL_NO_UPDATES
+        Remove-LockFile
+        [Environment]::Exit((Get-CWExitCode -Code $InternalExitCode))
+    }
+
+    for ($Index = 0; $Index -lt $UpdateCount; $Index++)
+    {
+        $Update = $SearchResult.Updates.Item($Index)
+        $MB     = [math]::Round(($Update.MaxDownloadSize / 1MB), 2)
+        $Info   = "{0} ({1}MB" -f $Update.Title, $MB
+        if ($Update.DriverClass)    { $Info += ", $($Update.DriverClass)" }
+        if ($Update.DriverProvider) { $Info += " / $($Update.DriverProvider)" }
+        $Info += ")"
+        Write-Log ("  [{0}/{1}] {2}" -f ($Index + 1), $UpdateCount, $Info) "INFO"
+    }
+
+    $UpdatesToDownload = New-Object -ComObject Microsoft.Update.UpdateColl
+    $ComObjects.Add($UpdatesToDownload)
+    foreach ($Update in $SearchResult.Updates)
+    {
+        if (-not $Update.EulaAccepted) { $Update.AcceptEula() }
+        [void]$UpdatesToDownload.Add($Update)
+    }
+
+    $Downloader         = $Session.CreateUpdateDownloader()
+    $Downloader.Updates = $UpdatesToDownload
+    $ComObjects.Add($Downloader)
+
+    Write-Log ("Downloading {0} update(s) without installing..." -f $UpdateCount) "INFO"
+    $DownloadStart    = Get-Date
+    $DownloadResult   = $Downloader.Download()
+    $DownloadDuration = (Get-Date) - $DownloadStart
+    Write-Log ("Download done in {0}s -- {1}" -f [math]::Round($DownloadDuration.TotalSeconds), (Get-ResultCodeText -Code $DownloadResult.ResultCode)) "INFO"
+
+    $ManifestUpdates   = [Collections.Generic.List[PSCustomObject]]::new()
+    $DownloadFailCount = 0
+
+    for ($Index = 0; $Index -lt $UpdatesToDownload.Count; $Index++)
+    {
+        $Update       = $UpdatesToDownload.Item($Index)
+        $UpdateResult = $DownloadResult.GetUpdateResult($Index)
+        if (($UpdateResult.ResultCode -eq 2) -and $Update.IsDownloaded)
+        {
+            $DownloadedCount++
+            Write-Log ("  Downloaded: {0}" -f $Update.Title) "SUCCESS"
+            $ManifestUpdates.Add([PSCustomObject]@{
+                UpdateID       = $Update.Identity.UpdateID
+                RevisionNumber = $Update.Identity.RevisionNumber
+                Title          = $Update.Title
+                DriverClass    = if ($Update.DriverClass)    { $Update.DriverClass }    else { "" }
+                DriverProvider = if ($Update.DriverProvider) { $Update.DriverProvider } else { "" }
+                DriverVerDate  = if ($Update.DriverVerDate)  { $Update.DriverVerDate.ToString("yyyy-MM-dd") } else { "" }
+                SizeMB         = [math]::Round(($Update.MaxDownloadSize / 1MB), 2)
+            })
+        }
+        else { $DownloadFailCount++; Write-Log ("  FAILED: {0}" -f $Update.Title) "ERROR" }
+    }
+
+    if ($DownloadedCount -eq 0) { $InternalExitCode = $INTERNAL_DOWNLOAD_FAIL; throw "All downloads failed." }
+
+    @{
+        CreatedAt    = (Get-Date).ToString("o")
+        ComputerName = $env:COMPUTERNAME
+        CreatedBy    = "{0} v{1}" -f $ScriptName, $ScriptVersion
+        UpdateCount  = $ManifestUpdates.Count
+        Updates      = @($ManifestUpdates)
+    } | ConvertTo-Json -Depth 10 | Out-File -FilePath $ManifestPath -Encoding UTF8 -Force
+    Write-Log ("Manifest: {0} ({1} update(s))" -f $ManifestPath, $ManifestUpdates.Count) "SUCCESS"
+
+    @{
+        Status       = "UpdatesReadyForInstall"
+        UpdateCount  = $ManifestUpdates.Count
+        ComputerName = $env:COMPUTERNAME
+        CreatedAt    = (Get-Date).ToString("o")
+    } | ConvertTo-Json -Depth 10 | Out-File -FilePath $MarkerPath -Encoding UTF8 -Force
+
+    Download-BrandingAssets | Out-Null
+
+    Write-Log "Setting up infrastructure..." "INFO"
+    $EventLogOk  = Register-EventLogSource
+    $ProtocolOk  = Register-ProtocolRegistry
+    $InstallOk   = Register-InstallTask
+    $BootTaskOk  = Register-BootFallbackTask
+    $ToastTaskOk = Register-ToastTask
+
+    if ((-not $EventLogOk) -or (-not $ProtocolOk) -or (-not $InstallOk))
+    {
+        Write-Log "Infrastructure registration issue detected." "WARN"
+        $InternalExitCode = $INTERNAL_INFRA_FAILED
+    }
+
+    if ($ToastTaskOk)
+    {
+        Start-Sleep -Seconds 2
+        try { Start-ScheduledTask -TaskName $ToastTaskName -ErrorAction Stop; Write-Log "Toast task started." "SUCCESS" }
+        catch { Write-Log ("Toast task start failed: {0}" -f $_.Exception.Message) "WARN" }
+    }
+
+    Write-Log "------------------------------------------------------------" "INFO"
+    Write-Log ("Found: {0} | Downloaded: {1} | Failed: {2}" -f $UpdateCount, $DownloadedCount, $DownloadFailCount) "INFO"
+    Write-Log "Companion scripts: embedded" "INFO"
+    Write-Log "UserState: normal-user writable click/status path" "INFO"
+    Write-Log "Protocol: direct powershell.exe (no cmd wrapper) + EditFlags + DefaultIcon" "INFO"
+    Write-Log "------------------------------------------------------------" "INFO"
+
+    if ($InternalExitCode -eq $INTERNAL_SUCCESS) { Write-Log "SUCCESS -- Updates downloaded and notification workflow started." "SUCCESS" }
+
+    Write-RunSummary @{
+        ScriptName           = $ScriptName
+        Version              = $ScriptVersion
+        ComputerName         = $env:COMPUTERNAME
+        Status               = if ($InternalExitCode -eq 0) { "Success" } else { "Partial" }
+        UpdatesFound         = $UpdateCount
+        Downloaded           = $DownloadedCount
+        DownloadFailed       = $DownloadFailCount
+        CompanionSource      = "Embedded"
+        InstallerVersion     = "3.5.5"
+        ToastVersion         = "1.4.0"
+        ProtocolHandlerVersion = "1.1.0"
+        NotifyIntervalHours  = $NotifyIntervalHours
+        NotifyMaxDays        = $NotifyMaxDays
+        BasePath             = $BasePath
+        LogPath              = $LogPath
+        UserStatePath        = $UserStatePath
+        ToastHeartbeatPath   = $ToastHeartbeatPath
+        ToastStatusPath      = $ToastStatusPath
+        ProtocolLogPath      = $ProtocolLogPath
+        Infra                = @{ Event = $EventLogOk; Protocol = $ProtocolOk; InstallTask = $InstallOk; BootTask = $BootTaskOk; ToastTask = $ToastTaskOk }
+        DownloadDurationSec  = [math]::Round($DownloadDuration.TotalSeconds)
+        ExitCode             = $InternalExitCode
+        Timestamp            = (Get-Date).ToString("o")
+    }
+}
+catch
+{
+    Write-Log ("CRITICAL: {0}" -f $_.Exception.Message) "ERROR"
+    if ($_.ScriptStackTrace) { Write-Log ("Stack: {0}" -f $_.ScriptStackTrace) "ERROR" }
+    if ($InternalExitCode -eq $INTERNAL_SUCCESS) { $InternalExitCode = $INTERNAL_CRITICAL }
+    Write-RunSummary @{ Status = "CriticalFailure"; Error = $_.Exception.Message; ExitCode = $InternalExitCode; Timestamp = (Get-Date).ToString("o") }
+}
+finally
+{
+    if ($ComObjects.Count -gt 0) { Clear-ComObjects -Objects $ComObjects }
+    Remove-LockFile
+    $CWExitCode = Get-CWExitCode -Code $InternalExitCode
+    Write-Log ("EXIT: DL={0} Internal={1} CW={2}" -f $DownloadedCount, $InternalExitCode, $CWExitCode) "INFO"
+    Write-Output ("EXIT: {0} v{1} -- DL={2} Internal={3} CW={4}" -f $ScriptName, $ScriptVersion, $DownloadedCount, $InternalExitCode, $CWExitCode)
+    [Environment]::Exit($CWExitCode)
+}
